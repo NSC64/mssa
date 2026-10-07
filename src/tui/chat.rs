@@ -105,6 +105,8 @@ impl Document {
             top_k: integer("top_k")?,
             max_new_tokens: integer("max_tokens")?,
             repetition_penalty: number("repetition_penalty")?,
+            certified_greedy: false,
+            bitnet_quantized: false,
         };
         validate(&config)?;
         let messages = v["messages"]

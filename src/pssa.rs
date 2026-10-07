@@ -1,7 +1,11 @@
 use crate::adapter::PlasticAdapterV2;
 use crate::backend::Device;
+use crate::bitnet::TernaryMatrix;
 use crate::linalg::{SimpleRng, dot_slice, sigmoid, softplus};
 use crate::memory::HyperbolicEpisodicBankV2;
+use crate::sparse_inference::{
+    CertifiedMemoryIndex, CertifiedVocabularyIndex, VocabularySearchStats,
+};
 use std::f32;
 
 // =============================================================================
@@ -493,6 +497,9 @@ pub struct PSSAContinuousBlockV2 {
     pub w_gate: ParamMatrix,
     pub w_proj: ParamMatrix,
     pub memory: HyperbolicEpisodicBankV2,
+    /// Runtime-only certified reader. Rebuild after a memory write.
+    pub certified_memory_index: Option<CertifiedMemoryIndex>,
+    pub certified_memory_epsilon: Option<f32>,
 
     // 4. Zero-Init Plastic Adapters
     pub adapters: Vec<PlasticAdapterV2>,
@@ -658,6 +665,8 @@ impl PSSAContinuousBlockV2 {
             w_gate,
             w_proj,
             memory,
+            certified_memory_index: None,
+            certified_memory_epsilon: None,
             adapters,
             adapter_up_effective,
             mlp_w1,
@@ -944,12 +953,40 @@ impl PSSAContinuousBlockV2 {
 
         HyperbolicEpisodicBankV2::diffeomorphic_project(&self.inf_q_euc, &mut self.inf_q_pnc);
 
-        self.memory.retrieve_soft_into(
-            &self.inf_q_pnc,
-            self.cfg.tau_mem,
-            &mut self.inf_m_val,
-            &mut self.inf_mem_weights,
-        );
+        if let (Some(index), Some(epsilon)) = (
+            self.certified_memory_index.as_mut(),
+            self.certified_memory_epsilon,
+        ) {
+            // A changed occupancy is safe to reject, while a same-sized bank
+            // is the normal read-only inference case. Writes through the model
+            // API invalidate the index before reaching this path.
+            if index.count() == self.memory.count {
+                index
+                    .retrieve_soft_into(
+                        &self.memory,
+                        &self.inf_q_pnc,
+                        self.cfg.tau_mem,
+                        epsilon,
+                        &mut self.inf_m_val,
+                        &mut self.inf_mem_weights,
+                    )
+                    .expect("validated certified memory index");
+            } else {
+                self.memory.retrieve_soft_into(
+                    &self.inf_q_pnc,
+                    self.cfg.tau_mem,
+                    &mut self.inf_m_val,
+                    &mut self.inf_mem_weights,
+                );
+            }
+        } else {
+            self.memory.retrieve_soft_into(
+                &self.inf_q_pnc,
+                self.cfg.tau_mem,
+                &mut self.inf_m_val,
+                &mut self.inf_mem_weights,
+            );
+        }
 
         self.w_gate.matvec(&self.inf_x_norm, &mut self.inf_g_mem);
         for i in 0..d_m {
@@ -1545,6 +1582,11 @@ pub struct PSSALayerV2 {
     pub layer_activations: Vec<Vec<f32>>,
     pub inf_features: Vec<f32>,
     pub inf_block_out: Vec<f32>,
+    /// Runtime-only exact branch-and-bound output index.
+    pub certified_vocabulary_index: Option<CertifiedVocabularyIndex>,
+    /// Runtime-only BitNet-style ternary output head.
+    pub bitnet_unembed: Option<TernaryMatrix>,
+    pub bitnet_activation_q: Vec<i8>,
 }
 
 impl std::ops::Deref for PSSALayerV2 {
@@ -1648,6 +1690,9 @@ impl PSSALayerV2 {
             layer_activations: (1..depth).map(|_| vec![0.0; l * d]).collect(),
             inf_features: vec![0.0; d],
             inf_block_out: vec![0.0; d],
+            certified_vocabulary_index: None,
+            bitnet_unembed: None,
+            bitnet_activation_q: vec![0; d],
         }
     }
     pub fn depth(&self) -> usize {
@@ -1728,6 +1773,51 @@ impl PSSALayerV2 {
         }
     }
 
+    /// Enable the paper's certified readers for inference. This runtime state
+    /// is intentionally absent from checkpoints and training.
+    pub fn enable_certified_inference(
+        &mut self,
+        memory_epsilon: f32,
+        memory_cluster_size: usize,
+        vocabulary_clusters: usize,
+    ) -> Result<(), String> {
+        if !(memory_epsilon.is_finite() && (0.0..1.0).contains(&memory_epsilon)) {
+            return Err("certified memory epsilon must be finite and in [0, 1)".into());
+        }
+        for block in std::iter::once(&mut self.block).chain(&mut self.extra_blocks) {
+            block.certified_memory_index = Some(CertifiedMemoryIndex::build(
+                &block.memory,
+                memory_cluster_size,
+            )?);
+            block.certified_memory_epsilon = Some(memory_epsilon);
+        }
+        self.certified_vocabulary_index = Some(CertifiedVocabularyIndex::build(
+            &self.unembed_w,
+            vocabulary_clusters,
+        )?);
+        Ok(())
+    }
+
+    pub fn disable_certified_inference(&mut self) {
+        for block in std::iter::once(&mut self.block).chain(&mut self.extra_blocks) {
+            block.certified_memory_index = None;
+            block.certified_memory_epsilon = None;
+        }
+        self.certified_vocabulary_index = None;
+    }
+
+    /// Build an inference-only b1.58 output head from the current FP32 rows.
+    /// Training and checkpoint weights remain FP32; optimizer updates
+    /// invalidate this cache and require an explicit rebuild.
+    pub fn enable_bitnet_inference(&mut self) -> Result<(), String> {
+        self.bitnet_unembed = Some(TernaryMatrix::from_param_rowwise(&self.unembed_w)?);
+        Ok(())
+    }
+
+    pub fn disable_bitnet_inference(&mut self) {
+        self.bitnet_unembed = None;
+    }
+
     /// Number of detached recurrent carry scalars retained between chunks.
     /// Ouro passes have independent temporal carries even though their weights
     /// are shared, so packed sequence replay must preserve every pass.
@@ -1767,9 +1857,8 @@ impl PSSALayerV2 {
         }
     }
 
-    pub fn forward_inference(&mut self, x_id: usize, logits_out: &mut [f32]) {
+    pub(crate) fn forward_inference_features(&mut self, x_id: usize) {
         assert!(x_id < self.cfg.d_vocab, "token ID must be in vocabulary");
-        assert_eq!(logits_out.len(), self.cfg.d_vocab);
         let d = self.cfg.d_latent;
         let loops = self.loops();
         if loops == 1 {
@@ -1822,11 +1911,64 @@ impl PSSALayerV2 {
                 }
             }
         }
+    }
+
+    pub fn forward_inference(&mut self, x_id: usize, logits_out: &mut [f32]) {
+        assert_eq!(logits_out.len(), self.cfg.d_vocab);
+        self.forward_inference_features(x_id);
         self.unembed_w.matvec(&self.inf_features, logits_out);
-        let logit_scale = 1.0 / (d as f32).sqrt();
+        let logit_scale = 1.0 / (self.cfg.d_latent as f32).sqrt();
         for logit in logits_out {
             *logit *= logit_scale;
         }
+    }
+
+    /// Quantized-output inference with FP32 recurrent features and stable
+    /// normalization. The output projection is the first MSSA BitNet target;
+    /// quantizing the recurrent carry itself is intentionally a separate study.
+    pub fn forward_inference_bitnet(
+        &mut self,
+        x_id: usize,
+        logits_out: &mut [f32],
+    ) -> Result<(), String> {
+        if logits_out.len() != self.cfg.d_vocab {
+            return Err("BitNet logits buffer has the wrong size".into());
+        }
+        self.forward_inference_features(x_id);
+        let quantized = self
+            .bitnet_unembed
+            .as_ref()
+            .ok_or("BitNet inference head is not enabled")?;
+        quantized.matvec_int8(
+            &self.inf_features,
+            &mut self.bitnet_activation_q,
+            logits_out,
+        )?;
+        let scale = 1.0 / (self.cfg.d_latent as f32).sqrt();
+        for logit in logits_out {
+            *logit *= scale;
+        }
+        Ok(())
+    }
+
+    /// Compute one recurrent step and use CVP to return the exact greedy ID.
+    /// This avoids materializing a vocabulary-sized logits vector.
+    pub fn forward_inference_certified_greedy(
+        &mut self,
+        x_id: usize,
+    ) -> Result<(usize, VocabularySearchStats), String> {
+        self.forward_inference_features(x_id);
+        self.certified_greedy_current()
+    }
+
+    pub(crate) fn certified_greedy_current(
+        &mut self,
+    ) -> Result<(usize, VocabularySearchStats), String> {
+        let index = self
+            .certified_vocabulary_index
+            .as_mut()
+            .ok_or("certified vocabulary index is not enabled")?;
+        index.exact_greedy_from(&self.unembed_w, &self.inf_features, 1)
     }
 
     /// Forward one weight-shared loop through the batched CPU/GPU stages.
@@ -2304,6 +2446,8 @@ impl PSSALayerV2 {
             }
             self.step_counter = step.expect("optimizer step counter overflow");
             ctx.invalidate_weights();
+            self.certified_vocabulary_index = None;
+            self.bitnet_unembed = None;
             return GradientClipOutcome::Applied { norm };
         }
         let mut tensors = self.adam_tensors();
@@ -2333,6 +2477,8 @@ impl PSSALayerV2 {
         if let Some(ctx) = self.device.gpu() {
             ctx.invalidate_weights();
         }
+        self.certified_vocabulary_index = None;
+        self.bitnet_unembed = None;
         GradientClipOutcome::Applied { norm }
     }
 
@@ -2355,6 +2501,10 @@ impl PSSALayerV2 {
         if let Some(ctx) = self.device.gpu() {
             ctx.invalidate_weights();
         }
+        // The output rows changed; a CVP radius/centroid index is no longer
+        // valid until the caller explicitly rebuilds it.
+        self.certified_vocabulary_index = None;
+        self.bitnet_unembed = None;
     }
     pub fn backward_and_step_chunk(&mut self, seq_len: usize) {
         self.zero_gradients();
@@ -2385,6 +2535,8 @@ impl PSSALayerV2 {
         }
         let loops = self.loops();
         for b in std::iter::once(&mut self.block).chain(&mut self.extra_blocks) {
+            b.certified_memory_index = None;
+            b.certified_memory_epsilon = None;
             let (k, d) = (b.cfg.d_mem_key, b.cfg.d_latent);
             let loop_l = if loops == 1 {
                 0

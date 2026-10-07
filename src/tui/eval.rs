@@ -635,6 +635,8 @@ impl Model {
                 top_k: 1,
                 repetition_penalty: 1.0,
                 max_new_tokens: suite.max_new_tokens,
+                certified_greedy: false,
+                bitnet_quantized: false,
             };
             sample.answer = match self {
                 Self::Pssa(model) => {
@@ -1697,6 +1699,8 @@ mod tests {
                 top_k: 1,
                 repetition_penalty: 1.0,
                 max_new_tokens: suite.max_new_tokens,
+                certified_greedy: false,
+                bitnet_quantized: false,
             },
         )
         .unwrap();

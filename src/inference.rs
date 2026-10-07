@@ -21,6 +21,11 @@ pub struct InferenceConfig {
     pub top_k: usize,
     pub repetition_penalty: f32,
     pub max_new_tokens: usize,
+    /// Use certified exact greedy output when the model has an index enabled.
+    /// This is restricted to temperature-zero, no-repetition-penalty decoding.
+    pub certified_greedy: bool,
+    /// Use the opt-in BitNet-style ternary output head when enabled on model.
+    pub bitnet_quantized: bool,
 }
 impl Default for InferenceConfig {
     fn default() -> Self {
@@ -30,6 +35,8 @@ impl Default for InferenceConfig {
             top_k: 24,
             repetition_penalty: 1.25,
             max_new_tokens: 64,
+            certified_greedy: false,
+            bitnet_quantized: false,
         }
     }
 }
@@ -239,7 +246,9 @@ impl<'a> PSSAInferenceEngine<'a> {
         C: Fn() -> bool,
     {
         self.try_generate_chat_turn_impl(
-            prompt, cfg, true,
+            prompt,
+            cfg,
+            true,
             |out, _, count, probability| callback(out, count, probability),
             cancelled,
             |_, _, _, _| {},
@@ -325,6 +334,14 @@ impl<'a> PSSAInferenceEngine<'a> {
             return Err(unknown_prompt_error(self.tokenizer, prompt));
         }
         let d_v = self.model.cfg.d_vocab;
+        let certified_greedy = cfg.certified_greedy
+            && cfg.temperature == 0.0
+            && cfg.repetition_penalty == 1.0
+            && !scored
+            && self.model.certified_vocabulary_index.is_some();
+        let bitnet_quantized = cfg.bitnet_quantized
+            && !certified_greedy
+            && self.model.bitnet_unembed.is_some();
         let mut logits = vec![0.0f32; d_v];
         let mut probs = vec![0.0f32; d_v];
         let mut candidates: Vec<(usize, f32)> = Vec::with_capacity(d_v);
@@ -340,7 +357,13 @@ impl<'a> PSSAInferenceEngine<'a> {
             if id >= d_v {
                 return Err(format!("prompt ID {id} outside model vocabulary"));
             }
-            self.model.forward_inference(id, &mut logits);
+            if certified_greedy {
+                self.model.forward_inference_features(id);
+            } else if bitnet_quantized {
+                self.model.forward_inference_bitnet(id, &mut logits)?;
+            } else {
+                self.model.forward_inference(id, &mut logits);
+            }
         }
         match self.tokenizer.kind() {
             TokenizerKind::Word => {
@@ -351,20 +374,39 @@ impl<'a> PSSAInferenceEngine<'a> {
                         break;
                     }
                     if step > 0 {
-                        self.model.forward_inference(
-                            *generated_ids.last().expect("generated token"),
-                            &mut logits,
-                        );
+                        if certified_greedy {
+                            // The certified call below performs the recurrent
+                            // step; do not advance it twice.
+                        } else {
+                            let id = *generated_ids.last().expect("generated token");
+                            if bitnet_quantized {
+                                self.model.forward_inference_bitnet(id, &mut logits)?;
+                            } else {
+                                self.model.forward_inference(id, &mut logits);
+                            }
+                        }
                     }
                     raw_confidence(&logits, &mut confidence);
-                    let selected = Self::sample(
-                        &mut self.rng,
-                        cfg,
-                        &generated_ids,
-                        &mut logits,
-                        &mut probs,
-                        &mut candidates,
-                    )?;
+                    let selected = if certified_greedy {
+                        if step == 0 {
+                            self.model.certified_greedy_current()?.0
+                        } else {
+                            self.model
+                                .forward_inference_certified_greedy(
+                                    *generated_ids.last().expect("prompt token"),
+                                )?
+                                .0
+                        }
+                    } else {
+                        Self::sample(
+                            &mut self.rng,
+                            cfg,
+                            &generated_ids,
+                            &mut logits,
+                            &mut probs,
+                            &mut candidates,
+                        )?
+                    };
                     last_probability = confidence.get(selected).copied().unwrap_or(0.0);
                     generated_ids.push(selected);
                     let token = self
@@ -412,20 +454,36 @@ impl<'a> PSSAInferenceEngine<'a> {
                         break;
                     }
                     if step > 0 {
-                        self.model.forward_inference(
-                            *generated_ids.last().expect("generated token"),
-                            &mut logits,
-                        );
+                        if !certified_greedy {
+                            let id = *generated_ids.last().expect("generated token");
+                            if bitnet_quantized {
+                                self.model.forward_inference_bitnet(id, &mut logits)?;
+                            } else {
+                                self.model.forward_inference(id, &mut logits);
+                            }
+                        }
                     }
                     raw_confidence(&logits, &mut confidence);
-                    let selected = Self::sample(
-                        &mut self.rng,
-                        cfg,
-                        &generated_ids,
-                        &mut logits,
-                        &mut probs,
-                        &mut candidates,
-                    )?;
+                    let selected = if certified_greedy {
+                        if step == 0 {
+                            self.model.certified_greedy_current()?.0
+                        } else {
+                            self.model
+                                .forward_inference_certified_greedy(
+                                    *generated_ids.last().expect("prompt token"),
+                                )?
+                                .0
+                        }
+                    } else {
+                        Self::sample(
+                            &mut self.rng,
+                            cfg,
+                            &generated_ids,
+                            &mut logits,
+                            &mut probs,
+                            &mut candidates,
+                        )?
+                    };
                     last_probability = confidence.get(selected).copied().unwrap_or(0.0);
                     generated_ids.push(selected);
                     raw.extend_from_slice(
@@ -476,7 +534,12 @@ impl<'a> PSSAInferenceEngine<'a> {
                 if emitted < raw.len() {
                     let tail = String::from_utf8_lossy(&raw[emitted..]);
                     out.push_str(&tail);
-                    callback(&out, Some(&tail), generated_ids.len() - prompt_ids.len(), last_probability);
+                    callback(
+                        &out,
+                        Some(&tail),
+                        generated_ids.len() - prompt_ids.len(),
+                        last_probability,
+                    );
                 }
                 Ok(out)
             }
@@ -571,25 +634,78 @@ mod tests {
             let tokenizer = word_tokenizer("word");
             let mut plain_model = tiny_model(&tokenizer);
             let mut scored_model = tiny_model(&tokenizer);
-            let cfg = InferenceConfig { temperature, top_k: 1, max_new_tokens: 3, ..Default::default() };
+            let cfg = InferenceConfig {
+                temperature,
+                top_k: 1,
+                max_new_tokens: 3,
+                ..Default::default()
+            };
             let plain = PSSAInferenceEngine::new(&mut plain_model, &tokenizer)
-                .try_generate_chat_turn_controlled("prompt", &cfg, |_, _| {}, || false).unwrap();
+                .try_generate_chat_turn_controlled("prompt", &cfg, |_, _| {}, || false)
+                .unwrap();
             let mut scores = Vec::new();
             let scored = PSSAInferenceEngine::new(&mut scored_model, &tokenizer)
-                .try_generate_chat_turn_scored("prompt", &cfg, |text, count, p| scores.push((text.to_owned(), count, p)), || false).unwrap();
+                .try_generate_chat_turn_scored(
+                    "prompt",
+                    &cfg,
+                    |text, count, p| scores.push((text.to_owned(), count, p)),
+                    || false,
+                )
+                .unwrap();
             assert_eq!(plain, scored);
             assert_eq!(scores.len(), 3);
-            for (_, _, p) in scores { assert_eq!(p, 1.0 / 3.0); } // includes unk, before top-k=1
+            for (_, _, p) in scores {
+                assert_eq!(p, 1.0 / 3.0);
+            } // includes unk, before top-k=1
             assert_eq!(plain_model.inf_features, scored_model.inf_features);
         }
         let tokenizer = bpe_tokenizer(0xc3);
         let mut model = tiny_model(&tokenizer);
         let mut scores = Vec::new();
-        PSSAInferenceEngine::new(&mut model, &tokenizer).try_generate_chat_turn_scored(
-            "a", &greedy(2), |text, count, p| scores.push((text.to_owned(), count, p)), || false).unwrap();
-        assert_eq!(scores.iter().map(|(_, n, _)| *n).collect::<Vec<_>>(), [1, 2, 2]);
+        PSSAInferenceEngine::new(&mut model, &tokenizer)
+            .try_generate_chat_turn_scored(
+                "a",
+                &greedy(2),
+                |text, count, p| scores.push((text.to_owned(), count, p)),
+                || false,
+            )
+            .unwrap();
+        assert_eq!(
+            scores.iter().map(|(_, n, _)| *n).collect::<Vec<_>>(),
+            [1, 2, 2]
+        );
         assert_eq!(scores[1].2, scores[2].2);
         assert_eq!(scores[2].0, "��");
+    }
+
+    #[test]
+    fn certified_greedy_matches_dense_greedy_without_double_stepping_prefill() {
+        let tokenizer = word_tokenizer("word");
+        let mut dense = tiny_model(&tokenizer);
+        let mut certified = tiny_model(&tokenizer);
+        certified
+            .enable_certified_inference(0.01, 1, 2)
+            .unwrap();
+        let cfg = InferenceConfig {
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            max_new_tokens: 4,
+            ..Default::default()
+        };
+        let expected = PSSAInferenceEngine::new(&mut dense, &tokenizer)
+            .try_generate_chat_turn("prompt", &cfg, |_| {})
+            .unwrap();
+        let actual = PSSAInferenceEngine::new(&mut certified, &tokenizer)
+            .try_generate_chat_turn(
+                "prompt",
+                &InferenceConfig {
+                    certified_greedy: true,
+                    ..cfg
+                },
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -785,6 +785,9 @@ fn actual_numeric_storage(m: &PSSALayerV2) -> usize {
         layer_activations,
         inf_features,
         inf_block_out,
+        certified_vocabulary_index: _,
+        bitnet_unembed: _,
+        bitnet_activation_q: _,
     } = m;
     matrix_bytes(embed_w)
         + matrix_bytes(unembed_w)
@@ -886,6 +889,8 @@ fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
         bwd_ssm_c,
         bwd_g_query_pnc,
         bwd_ssm_a,
+        certified_memory_index: _,
+        certified_memory_epsilon: _,
     } = b;
     let params: usize = [
         a_mat, w_delta, w_b, w_c, w_qx, w_qh, w_gate, w_proj, mlp_w1, mlp_w2,

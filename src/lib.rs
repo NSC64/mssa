@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod backend;
+pub mod bitnet;
 pub mod checkpoint;
 pub mod cli;
 pub mod comparison;
@@ -18,6 +19,7 @@ pub mod memory;
 pub mod pssa;
 pub mod scan_executor;
 pub mod sequence_batch;
+pub mod sparse_inference;
 pub mod training;
 mod training_diagnostics;
 pub mod transformer;

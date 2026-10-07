@@ -8,7 +8,9 @@ use crate::pssa::{PSSAConfigV2, PSSALayerV2};
 use serde_json::{Value, json};
 use std::fmt::Write as FmtWrite;
 use std::fs;
+use std::hint::black_box;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const DEFAULT_OUTPUT: &str = "__agent__/feature_results";
 const REPRO_ROOT: &str = "/workspace/pssa";
@@ -587,6 +589,89 @@ fn ridge_consolidation(dir: &Path) -> Result<(), String> {
     write_json(dir, "ridge_consolidation", &record)
 }
 
+fn bitnet_inference(dir: &Path) -> Result<(), String> {
+    let cfg = PSSAConfigV2 {
+        d_vocab: 512,
+        d_latent: 64,
+        d_state: 4,
+        d_mem_key: 8,
+        mem_capacity: 32,
+        chunk_len: 8,
+        ..Default::default()
+    };
+    let mut fp32 = PSSALayerV2::new(cfg.clone(), 7301);
+    let mut ternary = PSSALayerV2::new(cfg, 7301);
+    ternary.enable_bitnet_inference()?;
+    let tokens: Vec<usize> = (0..2048).map(|i| 1 + (i * 17) % 511).collect();
+    let mut fp_logits = vec![0.0; fp32.cfg.d_vocab];
+    let mut ternary_logits = vec![0.0; fp32.cfg.d_vocab];
+    let mut max_abs_error = 0.0f32;
+    let mut argmax_agreement = 0usize;
+    fp32.reset_recurrent_state();
+    ternary.reset_recurrent_state();
+    for &token in &tokens[..128] {
+        fp32.forward_inference(token, &mut fp_logits);
+        ternary.forward_inference_bitnet(token, &mut ternary_logits)?;
+        max_abs_error = max_abs_error.max(
+            fp_logits
+                .iter()
+                .zip(&ternary_logits)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max),
+        );
+        let fp_best = fp_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(id, _)| id);
+        let ternary_best = ternary_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(id, _)| id);
+        argmax_agreement += usize::from(fp_best == ternary_best);
+    }
+    let timed_tokens = &tokens[128..];
+    fp32.reset_recurrent_state();
+    let started = Instant::now();
+    for &token in timed_tokens {
+        fp32.forward_inference(token, black_box(&mut fp_logits));
+    }
+    let fp32_seconds = started.elapsed().as_secs_f64();
+    ternary.reset_recurrent_state();
+    let started = Instant::now();
+    for &token in timed_tokens {
+        ternary.forward_inference_bitnet(token, black_box(&mut ternary_logits))?;
+    }
+    let ternary_seconds = started.elapsed().as_secs_f64();
+    let full_bytes = fp32.unembed_w.data.len() * std::mem::size_of::<f32>();
+    let ternary_bytes = ternary.bitnet_unembed.as_ref().unwrap().storage_bytes();
+    let record = json!({
+        "experiment": "bitnet_b1_58_output_head_inference",
+        "reproduce_command": benchmark_command("bitnet"),
+        "protocol": {
+            "seed": 7301,
+            "vocab": fp32.cfg.d_vocab,
+            "latent": fp32.cfg.d_latent,
+            "weight_quantizer": "absmean RoundClip {-1,0,+1}",
+            "activation_quantizer": "symmetric per-token int8 absmax",
+            "stable_fp32_components": ["recurrent carry", "RMS normalization", "episodic values"],
+            "timed_tokens": timed_tokens.len(),
+        },
+        "measurements": {
+            "max_abs_logit_error": max_abs_error,
+            "argmax_agreement_first_128": argmax_agreement as f32 / 128.0,
+            "fp32_seconds": fp32_seconds,
+            "bitnet_seconds": ternary_seconds,
+            "bitnet_over_fp32_speedup": fp32_seconds / ternary_seconds.max(f64::MIN_POSITIVE),
+            "fp32_head_bytes": full_bytes,
+            "packed_ternary_head_bytes": ternary_bytes,
+            "head_memory_reduction": full_bytes as f64 / ternary_bytes.max(1) as f64,
+        },
+    });
+    write_json(dir, "bitnet_inference", &record)
+}
+
 fn read_json(dir: &Path, name: &str) -> Option<Value> {
     let bytes = fs::read(dir.join(format!("{name}.json"))).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -684,6 +769,19 @@ fn summary(dir: &Path) -> Result<(), String> {
         let m = &v["measurements"];
         writeln!(out, "| ridge consolidation | loss {:.6} -> {:.6} -> {:.6} (fast clear preserved: {}) | `{}` |", m["loss_before_consolidation"], m["loss_after_consolidation"], m["loss_after_fast_state_clear"], m["clearing_preserved_behavior"], v["reproduce_command"]).unwrap();
     }
+    if let Some(v) = read_json(dir, "bitnet_inference") {
+        let m = &v["measurements"];
+        writeln!(
+            out,
+            "| BitNet b1.58 output head | argmax agreement {:.3}, max logit error {:.5}, speedup {:.3}x, head memory reduction {:.2}x | `{}` |",
+            m["argmax_agreement_first_128"],
+            m["max_abs_logit_error"],
+            m["bitnet_over_fp32_speedup"],
+            m["head_memory_reduction"],
+            v["reproduce_command"]
+        )
+        .unwrap();
+    }
     if let Some(v) = read_json(dir, "continual_learning") {
         writeln!(
             out,
@@ -711,12 +809,14 @@ pub fn run(feature: &str, output: Option<&str>) -> Result<(), String> {
         "geometry" | "hyperbolic_vs_euclidean" => hyperbolic_vs_euclidean(&dir)?,
         "refractory" | "refractory_protection" => refractory(&dir)?,
         "ridge" | "ridge_consolidation" => ridge_consolidation(&dir)?,
+        "bitnet" | "bitnet_inference" => bitnet_inference(&dir)?,
         "all" => {
             continual(&dir)?;
             episodic_retention(&dir)?;
             hyperbolic_vs_euclidean(&dir)?;
             refractory(&dir)?;
             ridge_consolidation(&dir)?;
+            bitnet_inference(&dir)?;
         }
         other => {
             return Err(format!(
