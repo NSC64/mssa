@@ -23,3 +23,6 @@ docs/PROJECT-HANDOFF-*
 # Agent run scratch (never commit)
 .loops-fix/
 *_findings.md
+
+# Local manuscript retained until publication
+/paper.pdf

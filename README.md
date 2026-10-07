@@ -1,19 +1,30 @@
-# MSSA — memory-augmented state-space architecture
+# MSSA
 
-MSSA is a recurrent language-model research project written from scratch in
+## Memory-augmented state-space architecture
+
+MSSA is an experimental recurrent language-model architecture implemented in
 Rust. It combines a selective state-space recurrence, bounded episodic memory
-in hyperbolic space, plastic adapters, and a terminal workflow for training and
-evaluation.
+in hyperbolic space, plastic adapters, and a terminal workflow for training,
+evaluation, and reproducible benchmarking.
+
+MSSA is maintained as a research fork of
+[PSSA (Plastic State-Space Architecture)](https://github.com/Sparticle62ops/pssa),
+created by [Sparticle62ops](https://github.com/Sparticle62ops). The active fork is
+[Grego1801/mssa](https://github.com/Grego1801/mssa). The selective recurrence,
+episodic memory, plastic adapters, training infrastructure, accelerator
+backends, and terminal interface are derived from the upstream implementation.
+MSSA extends this foundation with experimental certified sparse inference and
+low-bit output-projection research.
 
 MSSA does not use transformer attention or a growing key/value cache. Each
 token updates a fixed-size recurrent carry and can read from a bounded memory
 bank. This gives inference a constant-size state while still allowing
 long-lived episodic information to be stored and retrieved.
 
-> **Current command name:** the repository is branded MSSA, while the Rust
-> package and executable retain the historical `pssa` compatibility name for
-> existing checkpoints and scripts. The examples below use `cargo run --release`
-> so they work without installing the binary.
+> **Compatibility note:** the repository is branded MSSA, while the Rust
+> package, executable, checkpoint extension, and several source paths retain
+> the historical `pssa` names. The examples use `cargo run --release` and
+> therefore do not require an installed executable.
 
 ## Design
 
@@ -54,15 +65,16 @@ and SiLU MLP.
 - Novel inputs can write new episodic slots.
 - Refractory counters prevent repeated contradictory writes from immediately
   erasing stable memories.
-- Fast adapter updates can be consolidated into persistent weights with a
-  closed-form ridge step.
+- Adapter consolidation transfers a configured fraction of the fast output
+  coefficients into a persistent coefficient bank, preserving their effective
+  sum up to floating-point rounding.
 - Training and inference retain scalar/reference paths so optimized CPU, CUDA,
   and WebGPU paths can be checked against known behavior.
 
-## Paper implementation
+## Certified inference implementation
 
-[`paper.pdf`](paper.pdf) is the source paper for the current MSSA work. The
-repository contains an opt-in prototype of its certified inference ideas:
+The implementation contains an opt-in certified inference path developed from
+the MSSA research direction:
 
 - `CertifiedMemoryIndex` clusters hyperbolic memory keys and computes a
   conservative omitted-softmax-mass bound.
@@ -74,24 +86,30 @@ repository contains an opt-in prototype of its certified inference ideas:
   updates.
 
 The certified path is an inference optimization. It does not change the
-training rule or checkpoint format. The main implementation is in
+training rule or checkpoint format. The primary implementation is in
 [`src/sparse_inference.rs`](src/sparse_inference.rs), with integration in
 [`src/pssa.rs`](src/pssa.rs) and generation routing in
 [`src/inference.rs`](src/inference.rs).
 
 ## BitNet research status
 
-MSSA also contains an opt-in BitNet b1.58 probe in
+MSSA also contains an opt-in BitNet b1.58 experimental implementation in
 [`src/bitnet.rs`](src/bitnet.rs). It uses packed ternary output-head weights
 and symmetric per-token int8 activations while keeping recurrent carries,
 normalization, and memory values in FP32.
 
-The local CPU benchmark showed a `12.8x` output-head memory reduction, but only
-`44.53%` argmax agreement and a `0.448x` BitNet/FP32 speed ratio. This
-post-training conversion is therefore experimental and is not enabled by
-default. A trained-from-scratch or QAT implementation and a hardware-specific
-integer kernel are still needed before it can be considered a useful deployment
-path.
+In a local CPU probe using a seeded, randomly initialized model with a
+512-token vocabulary and latent width 64, the packed representation was
+`12.8x` smaller than the FP32 output weights. Argmax agreement over 128 input
+tokens was `44.53%`, and the BitNet/FP32 end-to-end throughput ratio was
+`0.448x`. These measurements characterize this probe rather than language-model
+quality on a trained checkpoint. The FP32 master weights remain allocated, so
+the representation ratio is not a reduction in total process memory.
+
+The experimental path is not enabled by default. Quantization-aware training
+(QAT), trained-checkpoint evaluation, and optimized integer kernels are further
+research objectives. This implementation was informed by
+[BitNet b1.58](https://arxiv.org/abs/2402.17764).
 
 ## Build and run
 
@@ -100,13 +118,23 @@ path.
 - Rust 1.85 or newer with Edition 2024 support.
 - Cargo.
 - Network access only for HTTP or Hugging Face dataset sources.
-- Optional CUDA toolkit/driver support for `--features cuda`.
+- For CUDA execution: a build with `--features cuda`, a compatible NVIDIA
+  driver, and the required CUDA/cuBLAS runtime libraries.
 - Optional speech tools when building with `--features speech`.
+
+Obtain this fork:
+
+```bash
+git clone https://github.com/Grego1801/mssa.git
+cd mssa
+```
 
 Build the release binary:
 
 ```bash
 cargo build --release
+# Optional NVIDIA CUDA backend:
+cargo build --release --features cuda
 ```
 
 Run the terminal interface or command help:
@@ -118,9 +146,10 @@ cargo run --release -- help
 
 ## Training
 
-Train on the built-in reference corpus:
+Create an output directory and train on the built-in reference corpus:
 
 ```bash
+mkdir -p runs
 cargo run --release -- train science \
   --tokenizer bpe \
   --max-tokens 200000 \
@@ -273,9 +302,9 @@ cargo run --release -- benchmark \
   --out __agent__/bitnet_results
 ```
 
-Benchmark records are JSON files with a generated `summary.md`. GPU timings
-must be collected on an actual CUDA/WebGPU device; the local CPU benchmark is
-not a substitute for accelerator measurements.
+Benchmark records are JSON files with a generated `summary.md`. Timing reports
+should identify the model configuration, backend, hardware, and workload.
+Accelerator measurements require execution on the corresponding device.
 
 ## Development
 
@@ -300,8 +329,8 @@ the reference behavior within the tolerances covered by the test suite.
 The current model checkpoint extension is `.pssa`; transformer baseline files
 use `.trfm`. Checkpoints include model weights, tokenizer metadata, optimizer
 state, recurrent state, episodic memory, and schedule information as applicable.
-Runtime-only sparse indexes and quantized inference caches are rebuilt after
-loading and are not serialized.
+Runtime-only sparse indexes and quantized inference caches are not serialized;
+applications must explicitly enable and rebuild them after loading.
 
 Checkpoint repair and compatibility tests live in
 [`tests/checkpoint_repair.rs`](tests/checkpoint_repair.rs).
@@ -317,16 +346,30 @@ Checkpoint repair and compatibility tests live in
 | `src/inference.rs` | Generation and sampling APIs. |
 | `src/feature_benchmark.rs` | Deterministic feature benchmarks. |
 | `src/tui/` | Terminal interface. |
-| `paper.pdf` | Source paper for the certified inference work. |
 | `tests/` | Numerical, checkpoint, backend, and interface tests. |
 
 ## Project status
 
 MSSA is a research prototype. The certified sparse inference path is covered by
 exactness and fallback tests. BitNet post-training quantization currently saves
-memory but does not meet the quality/speed bar for a default path. Larger-scale
-training, paper-specific datasets, and real accelerator measurements remain
-future work.
+memory but does not meet the quality or performance requirements for a default
+path. Larger-scale training, research-specific datasets, and real accelerator
+measurements remain future work.
+
+## Attribution and community
+
+The original PSSA architecture and implementation are credited to
+[Sparticle62ops and upstream contributors](https://github.com/Sparticle62ops/pssa/graphs/contributors).
+Historical upstream results are documented in the
+[PSSA repository](https://github.com/Sparticle62ops/pssa); they should be evaluated
+under their reported configurations and protocols.
+
+- MSSA issues and contributions: [Grego1801/mssa](https://github.com/Grego1801/mssa/issues).
+- Upstream source and documentation: [Sparticle62ops/pssa](https://github.com/Sparticle62ops/pssa).
+- Upstream PSlabs community: [Discord](https://discord.gg/9sqfKeqWYF).
+
+The upstream project's published Solana support address is
+`4XPZ9uAa2BMoth6msoHRxTWL4mUrMfq3LGrxbAGja96h`.
 
 ## License
 
