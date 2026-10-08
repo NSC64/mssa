@@ -2712,16 +2712,11 @@ pub(crate) fn bwd_stage_ssm_with_input(
         return;
     }
     let executor = m.scan_executor.clone();
-    executor.run(|| bwd_stage_ssm_parallel(m, seq_len, input_is_embedding, None));
+    executor.run(|| bwd_stage_ssm_parallel(m, seq_len, input_is_embedding));
 }
 
 #[inline]
-fn bwd_stage_ssm_parallel(
-    m: &mut PSSALayerV2,
-    seq_len: usize,
-    input_is_embedding: bool,
-    gpu: Option<&crate::backend::GpuDispatch>,
-) {
+fn bwd_stage_ssm_parallel(m: &mut PSSALayerV2, seq_len: usize, input_is_embedding: bool) {
     let d_m = m.cfg.d_latent;
     let d_s = m.cfg.d_state;
     let stride = d_m * d_s;
@@ -2830,29 +2825,8 @@ fn bwd_stage_ssm_parallel(
         (&m.bwd_ssm_b[..l * d_s], &mut m.w_b, d_s),
         (&m.bwd_ssm_c[..l * d_s], &mut m.w_c, d_s),
     ] {
-        if let Some(gpu) = gpu {
-            gemm_nn_dev_into(
-                Some(gpu),
-                g,
-                &w.data,
-                l,
-                rows,
-                d_m,
-                &mut m.bwd_g_mlp[..l * d_m],
-            );
-            gemm_tn_dev_accumulate(
-                Some(gpu),
-                g,
-                &m.tape.x_norm[..l * d_m],
-                l,
-                rows,
-                d_m,
-                &mut w.grad,
-            );
-        } else {
-            dense_input_adjoint(g, &w.data, l, rows, d_m, &mut m.bwd_g_mlp[..l * d_m]);
-            dense_weight_adjoint(g, &m.tape.x_norm[..l * d_m], l, rows, d_m, &mut w.grad);
-        }
+        dense_input_adjoint(g, &w.data, l, rows, d_m, &mut m.bwd_g_mlp[..l * d_m]);
+        dense_weight_adjoint(g, &m.tape.x_norm[..l * d_m], l, rows, d_m, &mut w.grad);
         for (dst, src) in m.bwd_g_xnorm[..l * d_m]
             .iter_mut()
             .zip(&m.bwd_g_mlp[..l * d_m])

@@ -1,4 +1,4 @@
-# Stacked PSSA: operational CPU pilot
+# Stacked MSSA: operational CPU pilot
 
 Use the normal `train`, `generate`, and `evaluate` commands. The old research
 `width_depth_study` runner is not part of this integration and must not be used
@@ -81,7 +81,7 @@ Example single-window pilot, using existing regular CLI flags:
 
 ```sh
 cargo build --release
-BIN=target/release/pssa
+BIN=target/release/mssa
 CORPUS=data/frozen-clean.txt
 
 # Same corpus, 200k encoded-token window, one pass, chunk 64, accumulation 8.

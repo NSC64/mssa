@@ -13,7 +13,7 @@ use std::{collections::VecDeque, io::Read, path::PathBuf};
 
 const LABELS: [&str; 7] = [
     "original corpus",
-    "PSSA chain directory",
+    "MSSA chain directory",
     "new output directory",
     "links",
     "tokens per link",
@@ -41,7 +41,7 @@ impl Benchmark {
             return Err("Original corpus must be a local file.".into());
         }
         if !std::path::Path::new(&self.fields[1]).is_dir() {
-            return Err("PSSA chain must be an existing directory with ck01.pssa …".into());
+            return Err("MSSA chain must be an existing directory with ck01.pssa …".into());
         }
         let out = std::path::Path::new(&self.fields[2]);
         if self.fields[2].trim().is_empty() || out.exists() {
@@ -123,10 +123,11 @@ impl Benchmark {
         };
         if let Some(ok) = done {
             self.job = None;
-            let output = self
-                .launched_output
-                .take()
-                .expect("running benchmark has output snapshot");
+            let Some(output) = self.launched_output.take() else {
+                self.note = "Benchmark completed without an output path".into();
+                self.notification = Some((false, self.note.clone()));
+                return;
+            };
             if ok {
                 let path = output.join("results.json");
                 let result = (|| {
@@ -268,7 +269,7 @@ impl Benchmark {
                 accent(),
             ),
             Line::from(
-                "Replays the PSSA chain; trains ONLY the baseline; scores both on the next unseen 256 tokens.",
+                "Replays the MSSA chain; trains ONLY the baseline; scores both on the next unseen 256 tokens.",
             ),
             Line::from("↑/↓ choose • Enter edit • Ctrl+U clear • b run • Esc stop • Tab tabs"),
         ];

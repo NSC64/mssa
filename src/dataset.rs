@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use tokenizers::models::bpe::{BPE, BpeTrainer};
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::tokenizer::{NormalizerWrapper, PostProcessorWrapper};
 use tokenizers::{AddedToken, Tokenizer as HfTokenizer, TokenizerBuilder};
+
+const MAX_REMOTE_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Zero-copy sequence chunking iterator for TBPTT training batches.
 pub struct TokenChunkIterator<'a> {
@@ -61,8 +63,6 @@ pub struct Tokenizer {
     pub token_to_id: HashMap<String, usize>,
     pub id_to_token: HashMap<usize, String>,
     pub synsets: Vec<HashSet<String>>,
-    pub token_counts: Vec<usize>,
-    pub unigram_table: Vec<usize>,
     kind: TokenizerKind,
     backend: TokenizerBackend,
     /// Decoded byte representation of every BPE vocabulary entry. This is
@@ -99,23 +99,7 @@ impl Tokenizer {
         tokens
     }
 
-    fn unigram_table(counts: &[usize]) -> Vec<usize> {
-        let mut table = Vec::with_capacity(100_000);
-        let total: f64 = counts.iter().map(|&n| (n.max(1) as f64).powf(0.75)).sum();
-        let mut current = 0usize;
-        let mut cumulative = (counts[0].max(1) as f64).powf(0.75) / total;
-        for i in 0..100_000 {
-            let p = i as f64 / 100_000.0;
-            while p > cumulative && current + 1 < counts.len() {
-                current += 1;
-                cumulative += (counts[current].max(1) as f64).powf(0.75) / total;
-            }
-            table.push(current);
-        }
-        table
-    }
-
-    fn word_with_ordered_tokens(tokens: Vec<String>, counts: Vec<usize>) -> Result<Self, String> {
+    fn word_with_ordered_tokens(tokens: Vec<String>) -> Result<Self, String> {
         if tokens.len() < 2 {
             return Err("vocabulary must contain <unk> and at least one token".into());
         }
@@ -141,8 +125,6 @@ impl Tokenizer {
             token_to_id,
             id_to_token,
             synsets: vec![synonyms],
-            unigram_table: Self::unigram_table(&counts),
-            token_counts: counts,
             kind: TokenizerKind::Word,
             backend: TokenizerBackend::Word,
             token_bytes: Vec::new(),
@@ -151,7 +133,7 @@ impl Tokenizer {
 
     /// Restores an ordered legacy checkpoint vocabulary exactly; it never relearns IDs.
     pub fn from_vocabulary(ordered: &[String]) -> Result<Self, String> {
-        Self::word_with_ordered_tokens(ordered.to_vec(), vec![1; ordered.len()])
+        Self::word_with_ordered_tokens(ordered.to_vec())
     }
 
     /// Returns checkpoint-safe ID order, rejecting a corrupted/gapped map.
@@ -230,18 +212,13 @@ impl Tokenizer {
         words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let min_freq = if raw.len() < 1000 { 1 } else { 2 };
         let mut tokens = vec!["<unk>".into()];
-        let mut counts = vec![1usize];
-        let mut unknown = 0usize;
         for (word, count) in words {
             if tokens.len() >= 10_000 || (count < min_freq && word != "." && word != ",") {
-                unknown += count;
-            } else {
-                tokens.push(word);
-                counts.push(count);
+                continue;
             }
+            tokens.push(word);
         }
-        counts[0] = unknown.max(1);
-        Self::word_with_ordered_tokens(tokens, counts)
+        Self::word_with_ordered_tokens(tokens)
     }
 
     /// Trains a deterministic byte-level BPE from precisely the supplied
@@ -330,8 +307,6 @@ impl Tokenizer {
             token_to_id,
             id_to_token,
             synsets: Vec::new(),
-            token_counts: vec![1; vocab_size],
-            unigram_table: Self::unigram_table(&vec![1; vocab_size]),
             kind: TokenizerKind::Bpe,
             backend: TokenizerBackend::Bpe(backend),
             token_bytes,
@@ -798,13 +773,30 @@ impl DatasetManager {
             .unwrap_or_else(|_| Self::SCIENCE_REFERENCE_CORPUS.into())
     }
     fn download_url_raw(url: &str) -> Result<String, String> {
-        ureq::get(url)
-            .set("User-Agent", concat!("pssa/", env!("CARGO_PKG_VERSION")))
+        if !url.starts_with("https://") {
+            return Err("remote dataset URLs must use HTTPS".into());
+        }
+        let response = ureq::AgentBuilder::new()
+            .redirects(0)
+            .build()
+            .get(url)
+            .set("User-Agent", concat!("mssa/", env!("CARGO_PKG_VERSION")))
             .timeout(std::time::Duration::from_secs(60))
             .call()
-            .map_err(|e| format!("HTTP request failed: {e}"))?
-            .into_string()
-            .map_err(|e| format!("failed to read response body: {e}"))
+            .map_err(|e| format!("HTTPS request failed: {e}"))?;
+        let mut body = Vec::new();
+        response
+            .into_reader()
+            .take((MAX_REMOTE_BODY_BYTES + 1) as u64)
+            .read_to_end(&mut body)
+            .map_err(|e| format!("failed to read response body: {e}"))?;
+        if body.len() > MAX_REMOTE_BODY_BYTES {
+            return Err(format!(
+                "remote dataset response exceeds {} MiB cap",
+                MAX_REMOTE_BODY_BYTES / (1024 * 1024)
+            ));
+        }
+        String::from_utf8(body).map_err(|_| "remote dataset response is not UTF-8".into())
     }
 
     pub fn download_url_dataset(url: &str) -> Result<String, String> {
@@ -957,8 +949,7 @@ impl DatasetManager {
                     .map(|p| PathBuf::from(p).join("pssa/huggingface"))
             })
             .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|p| PathBuf::from(p).join(".cache/pssa/huggingface"))
+                std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".cache/pssa/huggingface"))
             })
             .unwrap_or_else(|| std::env::temp_dir().join("pssa/huggingface"));
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1173,8 +1164,10 @@ impl DatasetManager {
     /// common-field extraction). Explicit --hf-* training uses the paged,
     /// selected-field cache above without changing existing script inputs.
     pub fn download_huggingface_dataset(repo: &str) -> Result<String, String> {
+        Self::validate_huggingface_dataset_name(repo)?;
         let endpoint = format!(
-            "https://datasets-server.huggingface.co/rows?dataset={repo}&split=train&offset=0&limit=1000"
+            "https://datasets-server.huggingface.co/rows?dataset={}&split=train&offset=0&limit=1000",
+            encode_query_component(repo)
         );
         let body = Self::request_huggingface_json(&endpoint)?.to_string();
         let text = Self::extract_json_text(&body).ok_or_else(|| {

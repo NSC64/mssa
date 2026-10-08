@@ -58,7 +58,6 @@ struct ForwardBuffers {
     bar_b: CudaSlice<f32>,
     states: CudaSlice<f32>,
     y_ssm: CudaSlice<f32>,
-    memory: Option<MemoryBuffers>,
 }
 
 #[derive(Default)]
@@ -406,7 +405,6 @@ impl CudaContext {
             bar_b: d_bar_b,
             states: d_states,
             y_ssm: d_y,
-            memory: None,
         })
     }
 
@@ -751,7 +749,7 @@ impl CudaContext {
         m_inj: &mut [f32],
     ) -> Result<(), String> {
         let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
-        let mut fwd = state
+        let fwd = state
             .forward
             .take()
             .ok_or("CUDA SSM result is not resident")?;
@@ -793,7 +791,6 @@ impl CudaContext {
             self.readback_memory(
                 &mem, q_euc, q_pnc, q_norm, weights, m_val, g_mem, m_proj, m_inj,
             )?;
-            fwd.memory = Some(mem);
             Ok(())
         })();
         match result {

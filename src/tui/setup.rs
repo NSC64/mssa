@@ -2,7 +2,8 @@
 //! slow redraws (or quitting the dashboard) cannot hold up the child process.
 use super::device::DevicePicker;
 use super::{
-    AMBER, BRIGHT_RED, NORMAL_GREEN, RunState, accent, depth_zoom::DepthZoom, panel, panel_area, ring,
+    AMBER, BRIGHT_RED, NORMAL_GREEN, RunState, accent, depth_zoom::DepthZoom, panel, panel_area,
+    ring,
 };
 use crate::{
     cli::{TrainingBackend, resource_limits::ResourceLimits},
@@ -165,11 +166,17 @@ impl Setup {
     }
 
     fn transformer_resume(&self) -> bool {
-        Path::new(self.value(Resume)).extension().is_some_and(|e| e.eq_ignore_ascii_case("trfm"))
+        Path::new(self.value(Resume))
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("trfm"))
     }
 
     fn checkpoint_name(&self) -> &'static str {
-        if self.transformer_resume() { "model.trfm" } else { "model.pssa" }
+        if self.transformer_resume() {
+            "model.trfm"
+        } else {
+            "model.pssa"
+        }
     }
 
     fn value(&self, field: Field) -> &str {
@@ -551,7 +558,14 @@ impl Setup {
 
     fn args(&self) -> Vec<String> {
         let transformer = self.transformer_resume();
-        let mut args = vec![if transformer { "train-transformer" } else { "train" }.into()];
+        let mut args = vec![
+            if transformer {
+                "train-transformer"
+            } else {
+                "train"
+            }
+            .into(),
+        ];
         let mut push = |flag: &str, value: String| {
             args.extend([flag.to_owned(), value]);
         };
@@ -579,7 +593,9 @@ impl Setup {
             (Accumulate, "--accumulate"),
             (Backend, "--backend"),
         ] {
-            if transformer && matches!(field, Latent | State | Depth | Loops | Backend) { continue; }
+            if transformer && matches!(field, Latent | State | Depth | Loops | Backend) {
+                continue;
+            }
             push(flag, self.value(field).into());
         }
         for (field, flag) in [
@@ -771,7 +787,7 @@ impl Setup {
                 rows.push(Line::from(
                     "Threads can change reduction rounding; tiny RAM budgets may abort the child.",
                 ));
-                rows.push(Line::from("Quitting the TUI leaves training running; reopen with tail -f train.log | pssa tui."));
+                rows.push(Line::from("Quitting the TUI leaves training running; reopen with tail -f train.log | mssa tui."));
             }
         }
         let parameters_area = panel_area(f, body[0]);
@@ -918,7 +934,11 @@ impl RunSpec {
         })();
         match spawn {
             Ok((child, log)) => Ok(TrainingRun {
-                checkpoint_name: if self.args.first().is_some_and(|s| s == "train-transformer") { "model.trfm" } else { "model.pssa" },
+                checkpoint_name: if self.args.first().is_some_and(|s| s == "train-transformer") {
+                    "model.trfm"
+                } else {
+                    "model.pssa"
+                },
                 child,
                 log,
                 pending: Vec::new(),
@@ -1146,8 +1166,14 @@ mod tests {
         assert_eq!(setup.value(Chunk), "8");
         let args = setup.validate().unwrap().args;
         assert_eq!(args[0], "train-transformer");
-        assert!(args.windows(2).any(|w| w == ["--resume", resume.to_str().unwrap()]));
-        assert!(args.windows(2).any(|w| w[0] == "--out" && w[1].ends_with("model.trfm")));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--resume", resume.to_str().unwrap()])
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--out" && w[1].ends_with("model.trfm"))
+        );
         for flag in ["--latent", "--state", "--depth", "--loops", "--backend"] {
             assert!(!args.iter().any(|s| s == flag));
         }
@@ -1167,7 +1193,10 @@ mod tests {
             assert!(!args.iter().any(|arg| arg == "--batch-size"));
         }
         setup.values[Batch as usize] = "2".into();
-        let error = setup.validate().err().expect("unsupported batch must fail preflight");
+        let error = setup
+            .validate()
+            .err()
+            .expect("unsupported batch must fail preflight");
         assert!(error.contains("Transformer resume"));
         assert!(error.contains("batch"));
         assert!(error.contains("blank or 1"));
@@ -1188,12 +1217,21 @@ mod tests {
         assert_eq!(Path::new(&spec.args[index + 1]), output.join("model.pssa"));
         assert_eq!(setup.args(), original, "the base wizard is not mutated");
         assert!(spec.launch(true).is_err());
-        assert!(!output.exists(), "busy launch does not create output or spawn");
+        assert!(
+            !output.exists(),
+            "busy launch does not create output or spawn"
+        );
         let spec = setup.sweep_spec("0.002", "64", "2", &output).unwrap();
         fs::create_dir_all(&output).unwrap();
         fs::write(output.join("train.log"), "keep this log").unwrap();
-        assert!(spec.launch(false).is_err(), "recheck reservations at launch time");
-        assert_eq!(fs::read_to_string(output.join("train.log")).unwrap(), "keep this log");
+        assert!(
+            spec.launch(false).is_err(),
+            "recheck reservations at launch time"
+        );
+        assert_eq!(
+            fs::read_to_string(output.join("train.log")).unwrap(),
+            "keep this log"
+        );
         setup.values[Resume as usize] = "checkpoint.pssa".into();
         assert!(setup.sweep_spec("0.002", "64", "2", &output).is_err());
     }
@@ -1211,10 +1249,21 @@ mod tests {
         assert!(!Path::new(setup.value(Output)).exists());
         assert!(setup.message.contains("NOT started"));
         assert!(setup.validate().is_ok());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "not checkpoint bytes; never load in timeline/setup");
-        let index = setup.args().iter().position(|arg| arg == "--resume").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "not checkpoint bytes; never load in timeline/setup"
+        );
+        let index = setup
+            .args()
+            .iter()
+            .position(|arg| arg == "--resume")
+            .unwrap();
         assert_eq!(setup.args()[index + 1], path.to_str().unwrap());
-        assert!(setup.prepare_resume(fixture.0.join("missing.pssa")).is_err());
+        assert!(
+            setup
+                .prepare_resume(fixture.0.join("missing.pssa"))
+                .is_err()
+        );
     }
 
     #[test]

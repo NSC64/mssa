@@ -49,35 +49,46 @@ pub struct DreamSummary {
 /// cannot change an offline training run.
 /// The logit buffer is reused as sampling scratch and overwritten by the next
 /// model forward pass.
-pub(crate) fn sample_token(logits: &mut [f32], temperature: f32, rng: &mut SimpleRng) -> usize {
-    assert!(!logits.is_empty());
-    assert!(temperature.is_finite() && temperature > 0.0);
+pub(crate) fn sample_token(
+    logits: &mut [f32],
+    temperature: f32,
+    rng: &mut SimpleRng,
+) -> Result<usize, String> {
+    if logits.is_empty() {
+        return Err("dream generation received an empty logit vector".into());
+    }
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err("dream temperature must be finite and positive".into());
+    }
     let first = usize::from(logits.len() > 1);
     let max = logits[first..]
         .iter()
         .copied()
         .fold(f32::NEG_INFINITY, f32::max);
-    assert!(
-        max.is_finite(),
-        "dream generation received non-finite logits"
-    );
+    if !max.is_finite() {
+        return Err("dream generation received non-finite logits".into());
+    }
     let mut total = 0.0f32;
     for logit in &mut logits[first..] {
         let weight = ((*logit - max) / temperature).exp();
-        assert!(weight.is_finite());
+        if !weight.is_finite() {
+            return Err("dream sampling weight became non-finite".into());
+        }
         *logit = weight;
         total += weight;
     }
-    assert!(total.is_finite() && total > 0.0);
+    if !(total.is_finite() && total > 0.0) {
+        return Err("dream sampling weights have no finite mass".into());
+    }
     let draw = rng.gen_range_f32(0.0, total);
     let mut cumulative = 0.0;
     for (offset, &weight) in logits[first..].iter().enumerate() {
         cumulative += weight;
         if draw <= cumulative {
-            return first + offset;
+            return Ok(first + offset);
         }
     }
-    logits.len() - 1
+    Ok(logits.len() - 1)
 }
 
 #[cfg(test)]
@@ -93,12 +104,12 @@ mod tests {
         let draws: Vec<_> = (0..16)
             .map(|_| {
                 let mut logits = [100.0, -0.25, 0.0, 0.5, -0.5];
-                super::sample_token(&mut logits, 0.8, &mut rng)
+                super::sample_token(&mut logits, 0.8, &mut rng).unwrap()
             })
             .collect();
         assert_eq!(draws, [3, 2, 2, 2, 4, 1, 3, 1, 2, 3, 2, 3, 2, 3, 3, 4]);
         assert_eq!(rng.state, 15862471842254482758);
-        assert_eq!(super::sample_token(&mut [0.7], 0.8, &mut rng), 0);
+        assert_eq!(super::sample_token(&mut [0.7], 0.8, &mut rng).unwrap(), 0);
     }
 
     fn model() -> PSSALayerV2 {
@@ -234,7 +245,9 @@ mod tests {
         };
         let fast = model.block.adapters[0].up_proj.data.clone();
         let slow = model.block.adapters[0].consolidated_up.clone();
-        let summary = model.dream_replay(DreamMode::Generate, 1, 4, 0.8, &mut SimpleRng::new(77));
+        let summary = model
+            .dream_replay(DreamMode::Generate, 1, 4, 0.8, &mut SimpleRng::new(77))
+            .unwrap();
         assert_eq!(summary.entries_replayed, 1);
         assert_eq!(summary.generated_tokens, 4);
         assert!(summary.consolidation_delta_norm > 0.0);
@@ -250,8 +263,12 @@ mod tests {
     fn generated_dream_is_deterministic_for_a_fixed_seed() {
         let mut a = seeded_model();
         let mut b = seeded_model();
-        let sa = a.dream_replay(DreamMode::Generate, 1, 5, 0.8, &mut SimpleRng::new(88));
-        let sb = b.dream_replay(DreamMode::Generate, 1, 5, 0.8, &mut SimpleRng::new(88));
+        let sa = a
+            .dream_replay(DreamMode::Generate, 1, 5, 0.8, &mut SimpleRng::new(88))
+            .unwrap();
+        let sb = b
+            .dream_replay(DreamMode::Generate, 1, 5, 0.8, &mut SimpleRng::new(88))
+            .unwrap();
         assert_eq!(sa.entries_replayed, sb.entries_replayed);
         assert_eq!(sa.generated_tokens, sb.generated_tokens);
         assert_eq!(

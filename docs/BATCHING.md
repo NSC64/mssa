@@ -9,10 +9,10 @@ recurrent carry and truncated-backpropagation tape per lane.
 
 ```sh
 # Existing invocations are unchanged; --batch-size 1 is implicit.
-pssa train corpus.txt -o serial.pssa --chunk 64 --accumulate 8 -e 1
+mssa train corpus.txt -o serial.pssa --chunk 64 --accumulate 8 -e 1
 
 # Up to eight independent documents per microbatch.
-pssa train corpus.txt -o batched.pssa --chunk 64 --batch-size 8 --accumulate 1 -e 1
+mssa train corpus.txt -o batched.pssa --chunk 64 --batch-size 8 --accumulate 1 -e 1
 ```
 
 - `--chunk` remains the maximum sequence length **per lane**, not batch size

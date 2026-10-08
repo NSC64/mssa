@@ -923,7 +923,7 @@ impl CLIHandler {
         let first_lr = schedule.lr(1)?;
         let last_lr = schedule.lr(total_updates)?;
         println!(
-            "model=pssa parameters={} vocab={} depth={} loops={}",
+            "model=mssa parameters={} vocab={} depth={} loops={}",
             model.parameter_count(),
             model.cfg.d_vocab,
             model.depth(),
@@ -933,7 +933,7 @@ impl CLIHandler {
         if options.batch_size > 1 {
             crate::training::report_sequence_plan(&plan, options.batch_size);
         }
-        ui::banner("train", "plastic state-space architecture");
+        ui::banner("train", "memory-augmented state-space architecture");
         ui::field(
             "corpus",
             &format!("{} tokens", ui::thousands(docs.iter().map(Vec::len).sum())),
@@ -1175,7 +1175,7 @@ impl CLIHandler {
                         options.dream_len,
                         0.8,
                         rng,
-                    );
+                    )?;
                     println!(
                         "dream mode={:?} entries_replayed={} generated_tokens={} consolidation_delta_norm={:.6e} time={:.3}s",
                         options.dream_mode,
@@ -1632,20 +1632,20 @@ impl CLIHandler {
     }
 
     /// Everything the project can do, on one screen, with the state of the
-    /// working directory next to it. This is what `pssa` alone prints.
+    /// working directory next to it. This is what `mssa` alone prints.
     pub fn print_home() {
         ui::clear_screen();
         ui::logo();
         println!(
             "   {}  {}",
-            ui::dim("plastic state-space architecture"),
+            ui::dim("memory-augmented state-space architecture"),
             ui::dim(concat!("v", env!("CARGO_PKG_VERSION")))
         );
         println!();
 
         ui::panel_top("commands");
         for (name, blurb) in [
-            ("train", "fit a PSSA checkpoint on a text corpus"),
+            ("train", "fit an MSSA checkpoint on a text corpus"),
             ("train-transformer", "fit the CPU decoder-only baseline"),
             ("generate", "continue a prompt with a trained checkpoint"),
             (
@@ -1668,7 +1668,7 @@ impl CLIHandler {
             ("throughput", "measure frozen-model tokens/sec on a corpus"),
             (
                 "tui",
-                "live dashboard for a piped training run (train ... | pssa tui)",
+                "live dashboard for a piped training run (train ... | mssa tui)",
             ),
             (
                 "gpu-probe",
@@ -1676,7 +1676,7 @@ impl CLIHandler {
             ),
             (
                 "compare",
-                "replay a matched transformer against a PSSA chain",
+                "replay a matched transformer against an MSSA chain",
             ),
         ] {
             ui::panel_row(&format!(
@@ -1693,9 +1693,9 @@ impl CLIHandler {
         println!(
             "  {} {}",
             ui::dim("try"),
-            ui::bold("pssa train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1")
+            ui::bold("mssa train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1")
         );
-        println!("  {}", ui::dim("pssa help for every flag"));
+        println!("  {}", ui::dim("mssa help for every flag"));
         println!();
     }
 
@@ -1733,7 +1733,7 @@ impl CLIHandler {
             .unwrap_or(1);
         ui::panel_field("device", &format!("cpu, {threads} threads"));
         if checkpoints.is_empty() {
-            ui::panel_field("checkpoints", &ui::dim("none yet, run pssa train"));
+            ui::panel_field("checkpoints", &ui::dim("none yet, run mssa train"));
         } else {
             let shown = checkpoints.len().min(4);
             for (i, (name, size)) in checkpoints.iter().take(shown).enumerate() {
@@ -1840,13 +1840,13 @@ impl CLIHandler {
     }
 
     pub fn print_help() {
-        let bin = "pssa";
+        let bin = "mssa";
         println!();
         println!(
             "  {}  {}",
             ui::bold(&ui::cyan(bin)),
             ui::dim(concat!(
-                "plastic state-space architecture, v",
+                "memory-augmented state-space architecture, v",
                 env!("CARGO_PKG_VERSION")
             ))
         );
@@ -1880,7 +1880,7 @@ impl CLIHandler {
             ("throughput", "measure frozen-model tokens/sec on a corpus"),
             (
                 "tui",
-                "live dashboard for a piped training run (train ... | pssa tui)",
+                "live dashboard for a piped training run (train ... | mssa tui)",
             ),
             (
                 "gpu-probe",
@@ -1888,7 +1888,7 @@ impl CLIHandler {
             ),
             (
                 "compare",
-                "replay a matched transformer against a PSSA chain",
+                "replay a matched transformer against an MSSA chain",
             ),
             ("help", "show this message"),
         ] {
@@ -2066,7 +2066,7 @@ impl CLIHandler {
     }
 
     fn print_command_help(command: &str) -> Result<(), String> {
-        let bin = "pssa";
+        let bin = "mssa";
         let command = Self::canonical_command(command);
         match command {
             "train-transformer" => {
@@ -2307,7 +2307,7 @@ impl CLIHandler {
             "compare" => {
                 println!("Usage: {bin} compare DATA --chain-dir DIR --out NEW_DIR [OPTIONS]");
                 println!(
-                    "Replay an existing PSSA chain with the token/update-matched transformer; score both on unseen tokens."
+                    "Replay an existing MSSA chain with the token/update-matched transformer; score both on unseen tokens."
                 );
                 println!(
                     "--links 64 --window 200000 --batch-size 8 --accumulate 1 --eval-tokens 200000"
@@ -2882,7 +2882,7 @@ impl CLIHandler {
                 )
             }
             "tui" => crate::tui::run(&args[2..]),
-            _ => Err(format!("unknown command '{}'; run pssa help", args[1])),
+            _ => Err(format!("unknown command '{}'; run mssa help", args[1])),
         }
     }
 }
@@ -2967,7 +2967,7 @@ mod probe_tests {
 /// Bring up a GPU compute device, run a strict GEMM dispatch, and check the
 /// result against the CPU reference implementation without fallback.
 pub fn run_gpu_probe() -> Result<(), String> {
-    println!("=== pssa gpu-probe ===");
+    println!("=== mssa gpu-probe ===");
     let device = match Device::try_gpu() {
         Ok(d) => {
             println!("adapter: GPU compute device acquired");

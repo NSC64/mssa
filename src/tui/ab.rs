@@ -29,7 +29,7 @@ use std::{
 
 const MAX_OUTPUT: usize = 64 * 1024;
 const MAX_PROMPT: usize = 256 * 1024;
-pub(super) const HELP: &str = "/ab toggles A/B • /ab a PATH • /ab b PATH • /ab off\nPaths may contain spaces (optional surrounding quotes). PSSA / .trfm supported.\nSame prompt + system + attachments; no prior chat history. Replies are not saved.\nA then B: one model in RAM. Rates include prefill, exclude loading/waiting.";
+pub(super) const HELP: &str = "/ab toggles A/B • /ab a PATH • /ab b PATH • /ab off\nPaths may contain spaces (optional surrounding quotes). MSSA / .trfm supported.\nSame prompt + system + attachments; no prior chat history. Replies are not saved.\nA then B: one model in RAM. Rates include prefill, exclude loading/waiting.";
 
 fn clean(text: &str) -> String {
     text.chars()
@@ -387,7 +387,11 @@ impl Comparison {
             ]),
             chunks[0],
         );
-        let gap = if super::shadow::enabled(f.area()) { 1 } else { 0 };
+        let gap = if super::shadow::enabled(f.area()) {
+            1
+        } else {
+            0
+        };
         let columns = Layout::horizontal([
             Constraint::Percentage(50),
             Constraint::Length(gap),

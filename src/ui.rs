@@ -1,4 +1,4 @@
-//! Terminal presentation for the pssa command line.
+//! Terminal presentation for the MSSA command line.
 //!
 //! Colour, cursor control and screen clearing are emitted only when stdout is
 //! an interactive terminal and `NO_COLOR` is unset, so piped output, CI logs

@@ -547,13 +547,14 @@ impl PackedWorkspace {
             .ctx
             .seed_packed_gradients(&packed_gradients(m), &mut self.weight_grads)?;
         let beta = if resident_gradients { 1.0 } else { 0.0 };
-        let (d, s, k, hs) = (self.d, self.s, self.k, self.d * self.s);
+        let (d, s, k) = (self.d, self.s, self.k);
+        let hs = product(d, s, "packed backward rates")?;
         let (nr, dm, ds, stride, chunk, scale) = (
-            n as u32,
-            d as u32,
-            s as u32,
-            hs as u32,
-            self.chunk as u32,
+            elems(n, "packed backward rows")?,
+            elems(d, "packed latent width")?,
+            elems(s, "packed state width")?,
+            elems(hs, "packed backward stride")?,
+            elems(self.chunk, "packed chunk length")?,
             1.0 / (s as f32).sqrt(),
         );
         let xlen = elems(n * d, "packed backward latent")?;
@@ -583,8 +584,15 @@ impl PackedWorkspace {
             .packed_gemm(&self.gmp, &self.wp, n, d, d, true, &mut self.gmv)?;
         self.ctx
             .packed_weight_grad(&self.gg, &self.x, n, d, d, beta, &mut self.weight_grads[5])?;
-        self.ctx
-            .packed_weight_grad(&self.gmp, &self.mv, n, d, d, beta, &mut self.weight_grads[6])?;
+        self.ctx.packed_weight_grad(
+            &self.gmp,
+            &self.mv,
+            n,
+            d,
+            d,
+            beta,
+            &mut self.weight_grads[6],
+        )?;
         let (count, cap, dk, dv, tau) = (
             m.memory.count as u32,
             self.cap as u32,
@@ -614,10 +622,24 @@ impl PackedWorkspace {
                 .launch(packed_row_launch(nr))
                 .map_err(err)?;
         }
-        self.ctx
-            .packed_weight_grad(&self.gqe, &self.x, n, k, d, beta, &mut self.weight_grads[3])?;
-        self.ctx
-            .packed_weight_grad(&self.gqe, &self.y, n, k, d, beta, &mut self.weight_grads[4])?;
+        self.ctx.packed_weight_grad(
+            &self.gqe,
+            &self.x,
+            n,
+            k,
+            d,
+            beta,
+            &mut self.weight_grads[3],
+        )?;
+        self.ctx.packed_weight_grad(
+            &self.gqe,
+            &self.y,
+            n,
+            k,
+            d,
+            beta,
+            &mut self.weight_grads[4],
+        )?;
         self.ctx
             .packed_gemm(&self.gqe, &self.wqx, n, k, d, true, &mut self.tmp)?;
         self.ctx
@@ -1059,27 +1081,25 @@ mod tests {
         let state_rows = u32::MAX as usize / stride;
         // A one-lane state tape has one more row than its packed token maps.
         let largest_chunk = state_rows - 1;
-        assert!(validate_layout(
-            &[0],
-            &[largest_chunk as u32],
-            largest_chunk,
-            largest_chunk,
-            3584,
-            16,
-        ).is_ok());
-        assert!(validate_layout(
-            &[0],
-            &[state_rows as u32],
-            state_rows,
-            state_rows,
-            3584,
-            16,
-        ).unwrap_err().contains("u32 PTX index"));
+        assert!(
+            validate_layout(
+                &[0],
+                &[largest_chunk as u32],
+                largest_chunk,
+                largest_chunk,
+                3584,
+                16,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_layout(&[0], &[state_rows as u32], state_rows, state_rows, 3584, 16,)
+                .unwrap_err()
+                .contains("u32 PTX index")
+        );
         assert!(validate_layout(&[0x8000_0000], &[1], 1, 1, 1, 2).is_err());
         // Per-lane fixed state storage can overflow even with very few tokens.
-        assert!(validate_layout(
-            &[0, 1], &[1, 1], largest_chunk, 2, 3584, 16,
-        ).is_err());
+        assert!(validate_layout(&[0, 1], &[1, 1], largest_chunk, 2, 3584, 16,).is_err());
     }
 
     #[test]
@@ -1151,7 +1171,8 @@ mod tests {
             cpu.apply_adamw_with_grad_clip(1e-3, 1.0);
             gpu.apply_adamw_with_grad_clip(1e-3, 1.0);
         }
-        ctx.finish_safeguarded_training(&mut gpu.adam_tensors()).unwrap();
+        ctx.finish_safeguarded_training(&mut gpu.adam_tensors())
+            .unwrap();
         for (actual, expected) in gpu.adam_tensors().iter().zip(cpu.adam_tensors()) {
             close(actual.data, expected.data);
             close(actual.grad, expected.grad);

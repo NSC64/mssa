@@ -56,6 +56,7 @@ use ratatui::widgets::{
     Block, Borders, Paragraph, Tabs, Wrap,
     canvas::{Canvas, Line as CanvasLine, Points},
 };
+use std::collections::VecDeque;
 use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
@@ -167,7 +168,6 @@ struct RunState {
     progress_from: Option<f64>,
     progress_updated_at: Option<Instant>,
     live_loss: Option<f64>,
-    loss_average: Option<f64>,
     tok_s: Option<f64>,
     eta: Option<String>,
     updates_done: Option<u64>,
@@ -194,7 +194,7 @@ struct RunState {
     // Health checks are presentation-only; they never affect training.
     problem: Option<String>,
     warning: Option<String>,
-    tok_s_history: Vec<f64>,
+    tok_s_history: VecDeque<f64>,
     last_progress_at: Option<Instant>,
     training_active: bool,
     expected_lr_base: Option<f64>,
@@ -214,8 +214,7 @@ struct RunState {
     checkpoints: Vec<(String, Option<f64>)>,
     resumed_from: Option<String>,
     prior_steps: Option<u64>,
-    current_offset: Option<u64>,
-    raw_lines: Vec<String>,
+    raw_lines: VecDeque<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,9 +261,9 @@ impl RunState {
         if let Some(loops) = parse_kv::<usize>(line, "loops=") {
             self.loop_count = loops.clamp(1, 32);
         }
-        self.raw_lines.push(line.to_string());
+        self.raw_lines.push_back(line.to_string());
         if self.raw_lines.len() > 400 {
-            self.raw_lines.remove(0);
+            self.raw_lines.pop_front();
         }
 
         // `label  value` rows from the banner and summary panels
@@ -421,9 +420,9 @@ impl RunState {
                         ));
                     }
                 }
-                self.tok_s_history.push(speed.max(0.0));
+                self.tok_s_history.push_back(speed.max(0.0));
                 if self.tok_s_history.len() > 31 {
-                    self.tok_s_history.remove(0);
+                    self.tok_s_history.pop_front();
                 }
             }
             let sample = MetricSample {
@@ -481,11 +480,6 @@ impl RunState {
         }
         if let Some(prior) = parse_kv(line, "prior_updates=") {
             self.prior_steps = Some(prior);
-        }
-        if let Some(v) = parse_kv::<f64>(line, "loss_average=")
-            && v.is_finite()
-        {
-            self.loss_average = Some(v);
         }
         if let Some((done, total)) = parse_fraction(line, "optimizer_updates=") {
             self.updates_done = Some(done);
@@ -555,10 +549,6 @@ impl RunState {
         }
         if let Some(s) = parse_kv(line, "prior_steps=") {
             self.prior_steps = Some(s);
-        }
-        if let Some(v) = parse_kv(line, "offset ") {
-            // `--- ck32 (corpus offset 6200000) ---`
-            self.current_offset = Some(v);
         }
         if let Some(rest) = line.split("saved_checkpoint=").nth(1) {
             let path = rest.trim();
@@ -647,7 +637,7 @@ impl RunState {
         if self.tok_s_history.len() < 3 {
             return None;
         }
-        let mut values = self.tok_s_history.clone();
+        let mut values: Vec<_> = self.tok_s_history.iter().copied().collect();
         values.sort_by(f64::total_cmp);
         Some(values[values.len() / 2])
     }
@@ -1230,10 +1220,7 @@ fn finish_piped_stream(state: &mut RunState, completion: Option<bool>) {
     state.training_active = false;
 }
 
-fn release_finished_training(
-    training: &mut Option<setup::TrainingRun>,
-    was_active: bool,
-) -> bool {
+fn release_finished_training(training: &mut Option<setup::TrainingRun>, was_active: bool) -> bool {
     if was_active && training.as_ref().is_some_and(|run| !run.active()) {
         *training = None;
         true
@@ -1997,9 +1984,9 @@ fn draw_with_background(
         );
     } else {
         let title = if area.width >= 45 {
-            "PSSA / pssa tui  Ctrl+C quit  Tab tabs  F1 help"
+            "MSSA / mssa tui  Ctrl+C quit  Tab tabs  F1 help"
         } else {
-            "PSSA / pssa tui  F1 help"
+            "MSSA / mssa tui  F1 help"
         };
         f.render_widget(
             Paragraph::new(vec![Line::styled(title, accent()), status_badge(&health)]),
@@ -2033,8 +2020,7 @@ fn draw_with_background(
     let tabs_width = if compact_tabs {
         visible_tabs.iter().map(|tab| tab.len()).sum::<usize>() + visible_tabs.len() - 1
     } else {
-        visible_tabs.iter().map(|tab| tab.len() + 2).sum::<usize>()
-            + (visible_tabs.len() - 1) * 3
+        visible_tabs.iter().map(|tab| tab.len() + 2).sum::<usize>() + (visible_tabs.len() - 1) * 3
     } as u16;
     let nav = Layout::default()
         .direction(Direction::Horizontal)
@@ -2060,7 +2046,10 @@ fn draw_with_background(
                         .remove_modifier(Modifier::DIM),
                 )
                 .divider(if compact_tabs { "·" } else { " / " })
-                .padding(if compact_tabs { "" } else { " " }, if compact_tabs { "" } else { " " }),
+                .padding(
+                    if compact_tabs { "" } else { " " },
+                    if compact_tabs { "" } else { " " },
+                ),
             nav[0],
         );
     }
@@ -2130,7 +2119,7 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
             f.render_widget(
                 Paragraph::new(vec![
                     Line::styled("Waiting for feed samples", accent()),
-                    Line::from("Train with --hf-dataset OWNER/NAME --no-tui | pssa tui"),
+                    Line::from("Train with --hf-dataset OWNER/NAME --no-tui | mssa tui"),
                     Line::from("Older/local logs still work without previews."),
                 ])
                 .wrap(Wrap { trim: false })
@@ -2161,9 +2150,7 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
             vec![
                 Line::styled("[ awaiting sample ]", accent()),
                 Line::from("Stream HF training into this dashboard:"),
-                Line::from(
-                    "pssa train --hf-dataset OWNER/NAME --no-tui | pssa tui",
-                ),
+                Line::from("mssa train --hf-dataset OWNER/NAME --no-tui | mssa tui"),
             ],
         );
         draw_info_card(
@@ -2385,9 +2372,12 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
     let (start, end) = state.visible_graph_range();
     if end == 0 {
         let waiting_area = panel_area(f, area);
-        if view == GraphView::Comparison && let Some(error) = &state.comparison_error {
+        if view == GraphView::Comparison
+            && let Some(error) = &state.comparison_error
+        {
             f.render_widget(
-                Paragraph::new(error.as_str()).wrap(Wrap { trim: false })
+                Paragraph::new(error.as_str())
+                    .wrap(Wrap { trim: false })
                     .block(panel(" graph / comparison unavailable ")),
                 waiting_area,
             );
@@ -2991,7 +2981,7 @@ fn draw_chain(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             " connect a chain ",
             vec![
                 Line::styled("[ waiting for checkpoint files ]", accent()),
-                Line::from("pssa tui --chain \"path/to/chain\""),
+                Line::from("mssa tui --chain \"path/to/chain\""),
                 Line::from("Use the directory where your run saves checkpoints."),
                 Line::from("Read-only view / existing files stay untouched."),
             ],
@@ -3086,7 +3076,7 @@ fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
                     },
                     accent(),
                 ),
-                Line::from("pssa train [flags] --no-tui | pssa tui"),
+                Line::from("mssa train [flags] --no-tui | mssa tui"),
                 Line::from("Fields above show only values reported by the run."),
             ],
         );
@@ -3124,7 +3114,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .ok_or("invalid preview loops")?;
         return preview::worker(&args[1], loops);
     }
-    if let Some(result) = eval::run_worker(args) { return result; }
+    if let Some(result) = eval::run_worker(args) {
+        return result;
+    }
     // Keep the default useful on a local checkout; Kaggle callers can pass
     // their mounted chain explicitly (the training scripts already do).
     let mut chain_dir = PathBuf::from("chain");
@@ -3139,12 +3131,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     return Err("option '--chain' was specified more than once".into());
                 }
                 let value = args.get(i + 1).ok_or_else(|| {
-                    "option '--chain' requires a directory; usage: pssa tui [-c|--chain DIR]"
+                    "option '--chain' requires a directory; usage: mssa tui [-c|--chain DIR]"
                         .to_string()
                 })?;
                 if value.starts_with('-') {
                     return Err(format!(
-                        "option '{}' requires a directory; usage: pssa tui [-c|--chain DIR]",
+                        "option '{}' requires a directory; usage: mssa tui [-c|--chain DIR]",
                         args[i]
                     ));
                 }
@@ -3167,12 +3159,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     return Err("option '--compare' was specified more than once".into());
                 }
                 let value = args.get(i + 1).ok_or_else(|| {
-                    "option '--compare' requires a log file; usage: pssa tui [--compare LOG]"
+                    "option '--compare' requires a log file; usage: mssa tui [--compare LOG]"
                         .to_string()
                 })?;
                 if value.starts_with('-') {
                     return Err(
-                        "option '--compare' requires a log file; usage: pssa tui [--compare LOG]"
+                        "option '--compare' requires a log file; usage: mssa tui [--compare LOG]"
                             .to_string(),
                     );
                 }
@@ -3181,7 +3173,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown tui flag '{other}'; usage: pssa tui [-c|--chain DIR] [--compare LOG]"
+                    "unknown tui flag '{other}'; usage: mssa tui [-c|--chain DIR] [--compare LOG]"
                 ));
             }
         }
@@ -3201,7 +3193,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             return run_app(rx, chain_dir, compare_path, chats_dir).map_err(|e| e.to_string());
         }
         println!(
-            "Usage: pssa tui [-c|--chain DIR] [--compare LOG] [--chats-dir DIR] (interactive TTY required)"
+            "Usage: mssa tui [-c|--chain DIR] [--compare LOG] [--chats-dir DIR] (interactive TTY required)"
         );
         return Ok(());
     }

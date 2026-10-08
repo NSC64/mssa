@@ -86,7 +86,7 @@ impl Math {
         let v = &state.math;
         let n = |value: Option<u64>| value.map_or_else(|| "n/a".into(), |n| n.to_string());
         let mut lines = vec![
-            Line::styled("PSSA / executable equations", accent()),
+            Line::styled("MSSA / executable equations", accent()),
             Line::from(format!(
                 "LIVE latent {} / state {} / vocab {}",
                 n(v.latent),

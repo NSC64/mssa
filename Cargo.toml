@@ -3,13 +3,18 @@ name = "pssa"
 version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
-authors = ["Sparticle62ops"]
-description = "Plastic state-space language model in Rust with CPU, CUDA (cuBLAS), and WebGPU backends, stacked depth, shared loops, and a terminal UI"
+authors = ["NSC64 MSSA contributors", "Sparticle62ops"]
+description = "MSSA memory-augmented state-space language model in Rust with CPU, CUDA, WebGPU, and terminal interfaces"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/Sparticle62ops/pssa"
+repository = "https://github.com/NSC64/mssa"
 readme = "README.md"
 keywords = ["language-model", "state-space", "machine-learning", "cuda", "webgpu"]
 categories = ["science", "command-line-utilities"]
+default-run = "mssa"
+
+[[bin]]
+name = "mssa"
+path = "src/bin/mssa.rs"
 
 [dependencies]
 # HTTP/HTTPS streaming for corpus downloads. Held at ureq 2.x for now.

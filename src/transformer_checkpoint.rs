@@ -91,7 +91,7 @@ pub fn load_checkpoint(path: impl AsRef<Path>) -> wire::Result<TransformerModel>
     let bytes = wire::read_file_capped(path.as_ref())?;
     if bytes.len() < 6 || &bytes[..4] != b"TRFM" || bytes[4..6] != 1u16.to_le_bytes() {
         return Err(invalid(
-            "expected a TRFM v1 checkpoint; use train for PSSA checkpoints",
+            "expected a TRFM v1 checkpoint; use train for MSSA checkpoints",
         ));
     }
     let payload = wire::checked_payload(&bytes, "TRFM v1")?;
@@ -131,11 +131,21 @@ pub fn load_checkpoint(path: impl AsRef<Path>) -> wire::Result<TransformerModel>
     };
     // Every parameter must have data, grad, m and v bytes present before model
     // allocation. Shape declarations cannot turn tiny files into huge models.
-    let count = 2 * cfg.d_vocab * cfg.d_model
-        + 4 * cfg.d_model * cfg.d_model
-        + 2 * cfg.d_model * cfg.d_ff
-        + 4 * cfg.d_model;
-    if r.remaining() < count * 16 + 10 * 4 * 8 {
+    let count = 2usize
+        .checked_mul(
+            cfg.d_vocab
+                .checked_mul(cfg.d_model)
+                .ok_or_else(|| invalid("transformer parameter element count overflow"))?,
+        )
+        .and_then(|n| n.checked_add(4usize.checked_mul(cfg.d_model.checked_mul(cfg.d_model)?)?))
+        .and_then(|n| n.checked_add(2usize.checked_mul(cfg.d_model.checked_mul(cfg.d_ff)?)?))
+        .and_then(|n| n.checked_add(4usize.checked_mul(cfg.d_model)?))
+        .ok_or_else(|| invalid("transformer parameter element count overflow"))?;
+    let required = count
+        .checked_mul(16)
+        .and_then(|n| n.checked_add(10 * 4 * 8))
+        .ok_or_else(|| invalid("transformer parameter byte count overflow"))?;
+    if r.remaining() < required {
         return Err(invalid("truncated transformer parameter tensors"));
     }
     let mut model = TransformerModel::new(cfg, 1).map_err(invalid)?;

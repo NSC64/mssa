@@ -2861,6 +2861,7 @@ impl PSSALayerV2 {
         rng: &mut SimpleRng,
     ) -> crate::dream::DreamSummary {
         self.dream_replay(crate::dream::DreamMode::Memory, replay, 0, 0.8, rng)
+            .expect("memory-only dream replay cannot sample tokens")
     }
 
     /// Run a host-only offline sleep phase. Memory values are sampled first;
@@ -2875,25 +2876,29 @@ impl PSSALayerV2 {
         dream_len: usize,
         temperature: f32,
         rng: &mut SimpleRng,
-    ) -> crate::dream::DreamSummary {
+    ) -> Result<crate::dream::DreamSummary, String> {
         let started = Instant::now();
         if replay == 0 {
-            return crate::dream::DreamSummary {
+            return Ok(crate::dream::DreamSummary {
                 elapsed_seconds: started.elapsed().as_secs_f64(),
                 ..Default::default()
-            };
+            });
         }
         if mode.includes_generation() {
-            assert!(dream_len > 0);
-            assert!(temperature.is_finite() && temperature > 0.0);
+            if dream_len == 0 {
+                return Err("dream generation length must be positive".into());
+            }
+            if !(temperature.is_finite() && temperature > 0.0) {
+                return Err("dream temperature must be finite and positive".into());
+            }
         }
         let mut entries = self.dream_memory_entries();
         let take = replay.min(entries.len());
         if take == 0 {
-            return crate::dream::DreamSummary {
+            return Ok(crate::dream::DreamSummary {
                 elapsed_seconds: started.elapsed().as_secs_f64(),
                 ..Default::default()
-            };
+            });
         }
         for i in 0..take {
             let remaining = entries.len() - i;
@@ -2916,11 +2921,11 @@ impl PSSALayerV2 {
                 // state inside each sequence.
                 self.copy_recurrent_state_from(&recurrent);
                 self.forward_dream_input(value, &mut logits);
-                let mut token = crate::dream::sample_token(&mut logits, temperature, rng);
+                let mut token = crate::dream::sample_token(&mut logits, temperature, rng)?;
                 for _ in 0..dream_len {
                     self.forward_inference(token, &mut logits);
                     generated.push(self.inf_features.clone());
-                    token = crate::dream::sample_token(&mut logits, temperature, rng);
+                    token = crate::dream::sample_token(&mut logits, temperature, rng)?;
                 }
             }
         }
@@ -2943,12 +2948,12 @@ impl PSSALayerV2 {
         } else {
             0.0
         };
-        crate::dream::DreamSummary {
+        Ok(crate::dream::DreamSummary {
             entries_replayed: take,
             generated_tokens: generated.len(),
             consolidation_delta_norm,
             elapsed_seconds: started.elapsed().as_secs_f64(),
-        }
+        })
     }
 
     pub fn insert_training_memory_at(&mut self, loss: f32, last: usize) {

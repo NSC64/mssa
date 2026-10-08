@@ -1071,7 +1071,7 @@ impl Kaggle {
             Line::from("Credentials: KAGGLE_USERNAME + KAGGLE_KEY, else ~/.kaggle/kaggle.json"),
             Line::from("No key is displayed or saved. Keep kaggle.json private (chmod 600)."),
             Line::from("Enter review • Y confirm • N/Esc cancel • Ctrl+U clear • Tab tabs"),
-            Line::from("Run pssa with --no-tui in the notebook for parseable monitor metrics."),
+            Line::from("Run mssa with --no-tui in the notebook for parseable monitor metrics."),
         ];
         if let Some(prepared) = &self.prepared {
             text.extend(prepared.summary.lines().map(|s| Line::from(s.to_owned())));

@@ -540,7 +540,7 @@ fn upload_with(
     }
     active(cancel)?;
     let card = format!(
-        "---\ntags:\n- pssa\n---\n\n# PSSA checkpoint\n\nUploaded with the PSSA TUI.\n\n- File: `model.{extension}`\n- Checkpoint bytes: {size}\n- SHA-256: `{oid}`\n\nLoad this checkpoint with the matching PSSA version.\nTraining dataset, metrics, license and hardware are not inferred; add verified details before sharing.\n"
+        "---\ntags:\n- mssa\n- pssa\n---\n\n# MSSA checkpoint\n\nUploaded with the MSSA TUI; derived from the PSSA project.\n\n- File: `model.{extension}`\n- Checkpoint bytes: {size}\n- SHA-256: `{oid}`\n\nLoad this checkpoint with the matching MSSA version.\nTraining dataset, metrics, license and hardware are not inferred; add verified details before sharing.\n"
     );
     let body = commit_body(extension, &oid, size, &card);
     let result = hub.commit(repo, &body)?;
@@ -620,7 +620,7 @@ impl Read for CheckedFile<'_> {
     }
 }
 fn commit_body(extension: &str, oid: &str, size: u64, card: &str) -> String {
-    [json!({"key":"header","value":{"summary":"Upload PSSA checkpoint and model card","description":""}}),
+    [json!({"key":"header","value":{"summary":"Upload MSSA checkpoint and model card","description":""}}),
      json!({"key":"lfsFile","value":{"path":format!("model.{extension}"),"algo":"sha256","oid":oid,"size":size}}),
      json!({"key":"file","value":{"path":"README.md","encoding":"base64","content":base64(card.as_bytes())}})]
         .into_iter().map(|v| format!("{v}\n")).collect()

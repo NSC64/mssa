@@ -26,7 +26,8 @@ BIN="$CARGO_TARGET_DIR/release/pssa"
 ```
 
 On Kaggle use its normal Rust toolchain/build and set
-`BIN=./target/release/pssa` instead of the workspace-specific Zig paths.
+`BIN=./target/release/mssa` instead of the workspace-specific Zig paths. The
+historical `pssa` executable remains available as a compatibility alias.
 The output directory must not already exist; its parent must exist. This avoids
 overwriting a previous experiment. Defaults match the flags above; evaluation's
 default offset is the sum of the links' encoded-token budgets. Seed defaults to

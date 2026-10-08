@@ -257,7 +257,7 @@ impl HyperbolicEpisodicBankV2 {
             current_step,
             surprise,
         ) {
-            UpdateOutcome::Defended { .. } | UpdateOutcome::Stable { .. } => None,
+            UpdateOutcome::Defended { .. } => None,
             UpdateOutcome::Overwritten => {
                 let inserted = self.insert_with_device(key_pnc, val, device);
                 self.last_seen_step[inserted] = current_step;

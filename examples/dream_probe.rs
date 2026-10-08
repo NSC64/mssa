@@ -60,7 +60,9 @@ fn run(dream: bool) -> (f32, f32) {
     for _ in 0..12 {
         update(&mut model, &TASK_B_INPUTS, &TASK_B_TARGETS);
         if dream {
-            let summary = model.dream_replay(DreamMode::Memory, 1, 0, 0.8, &mut rng);
+            let summary = model
+                .dream_replay(DreamMode::Memory, 1, 0, 0.8, &mut rng)
+                .unwrap();
             debug_assert_eq!(summary.entries_replayed, 1);
         }
     }

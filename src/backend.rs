@@ -132,105 +132,6 @@ fn gemm_main(
     }
 }
 
-// -----------------------------------------------------------------------------
-// 2. Parallel Affine RMSNorm: out = gamma * (x / RMS(x)) + beta
-// -----------------------------------------------------------------------------
-struct NormUniforms {
-    dim: u32,
-    eps: f32,
-};
-
-@group(0) @binding(0) var<uniform> norm_cfg: NormUniforms;
-@group(0) @binding(1) var<storage, read> raw_x: array<f32>;
-@group(0) @binding(2) var<storage, read> gamma: array<f32>;
-@group(0) @binding(3) var<storage, read> beta: array<f32>;
-@group(0) @binding(4) var<storage, read_write> norm_out: array<f32>;
-
-@compute @workgroup_size(256, 1, 1)
-fn affine_rmsnorm_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let token_idx = global_id.y;
-    let dim = norm_cfg.dim;
-    let base_off = token_idx * dim;
-
-    var sum_sq: f32 = 0.0;
-    for (var i: u32 = 0u; i < dim; i = i + 1u) {
-        let val = raw_x[base_off + i];
-        sum_sq = sum_sq + val * val;
-    }
-
-    let inv_rms = 1.0 / sqrt(sum_sq / f32(dim) + norm_cfg.eps);
-    let feat_idx = global_id.x;
-
-    if (feat_idx < dim) {
-        let v = raw_x[base_off + feat_idx];
-        norm_out[base_off + feat_idx] = gamma[feat_idx] * (v * inv_rms) + beta[feat_idx];
-    }
-}
-
-// -----------------------------------------------------------------------------
-// 3. Fused SiLU Non-Linearity & Residual Addition
-// -----------------------------------------------------------------------------
-@group(0) @binding(0) var<storage, read> act_in: array<f32>;
-@group(0) @binding(1) var<storage, read_write> act_out: array<f32>;
-
-@compute @workgroup_size(256, 1, 1)
-fn silu_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let idx = global_id.x;
-    if (idx < arrayLength(&act_in)) {
-        let v = act_in[idx];
-        let sig = 1.0 / (1.0 + exp(-v));
-        act_out[idx] = v * sig;
-    }
-}
-
-// -----------------------------------------------------------------------------
-// 4. In-Place VRAM-Native AdamW Optimizer Kernel
-// -----------------------------------------------------------------------------
-struct AdamWUniforms {
-    lr: f32,
-    beta1: f32,
-    beta2: f32,
-    weight_decay: f32,
-    eps: f32,
-    step: f32,
-    len: u32,
-};
-
-@group(0) @binding(0) var<uniform> adam_cfg: AdamWUniforms;
-@group(0) @binding(1) var<storage, read_write> params: array<f32>;
-@group(0) @binding(2) var<storage, read> grads: array<f32>;
-@group(0) @binding(3) var<storage, read_write> m_moments: array<f32>;
-@group(0) @binding(4) var<storage, read_write> v_moments: array<f32>;
-
-@compute @workgroup_size(256, 1, 1)
-fn adamw_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let idx = global_id.x;
-    if (idx >= adam_cfg.len) {
-        return;
-    }
-
-    let g = grads[idx];
-    var p = params[idx];
-
-    // Decoupled Weight Decay
-    if (adam_cfg.weight_decay > 0.0) {
-        p = p - adam_cfg.lr * adam_cfg.weight_decay * p;
-    }
-
-    let m_new = adam_cfg.beta1 * m_moments[idx] + (1.0 - adam_cfg.beta1) * g;
-    let v_new = adam_cfg.beta2 * v_moments[idx] + (1.0 - adam_cfg.beta2) * g * g;
-
-    m_moments[idx] = m_new;
-    v_moments[idx] = v_new;
-
-    let bias1 = 1.0 - pow(adam_cfg.beta1, adam_cfg.step);
-    let bias2 = 1.0 - pow(adam_cfg.beta2, adam_cfg.step);
-
-    let m_hat = m_new / bias1;
-    let v_hat = v_new / bias2;
-
-    params[idx] = p - adam_cfg.lr * m_hat / (sqrt(v_hat) + adam_cfg.eps);
-}
 "#;
 
 // =============================================================================
@@ -324,9 +225,6 @@ pub struct WgpuContext {
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     pub gemm_pipeline: Arc<wgpu::ComputePipeline>,
-    pub norm_pipeline: Arc<wgpu::ComputePipeline>,
-    pub silu_pipeline: Arc<wgpu::ComputePipeline>,
-    pub adamw_pipeline: Arc<wgpu::ComputePipeline>,
     pub(crate) scan_pipeline: Arc<wgpu::ComputePipeline>,
     pub(crate) scan_apply_pipeline: Arc<wgpu::ComputePipeline>,
     pub(crate) ssm_prepare_pipeline: Arc<wgpu::ComputePipeline>,
@@ -392,7 +290,7 @@ impl WgpuContext {
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
-                label: Some("PSSA V2 GPU Device"),
+                label: Some("MSSA GPU Device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
                     // The recurrent backward stage binds eighteen storage buffers.
@@ -411,7 +309,7 @@ impl WgpuContext {
             wgpu_stages::WGSL_STAGE_KERNELS
         );
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("PSSA V2 Compute Shaders"),
+            label: Some("MSSA Compute Shaders"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source)),
         });
 
@@ -422,26 +320,6 @@ impl WgpuContext {
             entry_point: "gemm_main",
         });
 
-        let norm_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("RMSNorm Pipeline"),
-            layout: None,
-            module: &shader_module,
-            entry_point: "affine_rmsnorm_main",
-        });
-
-        let silu_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("SiLU Pipeline"),
-            layout: None,
-            module: &shader_module,
-            entry_point: "silu_main",
-        });
-
-        let adamw_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("AdamW Pipeline"),
-            layout: None,
-            module: &shader_module,
-            entry_point: "adamw_main",
-        });
         let scan_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("WGSL affine scan Pipeline"),
             layout: None,
@@ -516,9 +394,6 @@ impl WgpuContext {
             device: Arc::new(device),
             queue: Arc::new(queue),
             gemm_pipeline: Arc::new(gemm_pipeline),
-            norm_pipeline: Arc::new(norm_pipeline),
-            silu_pipeline: Arc::new(silu_pipeline),
-            adamw_pipeline: Arc::new(adamw_pipeline),
             scan_pipeline: Arc::new(scan_pipeline),
             scan_apply_pipeline: Arc::new(scan_apply_pipeline),
             ssm_prepare_pipeline: Arc::new(ssm_prepare_pipeline),
@@ -1576,85 +1451,5 @@ mod backend_tests {
             mapped_at_creation: false,
         });
         assert!(finish_error_scopes(&ctx.device).is_err());
-    }
-}
-
-#[derive(Clone)]
-pub enum TensorBuffer {
-    Cpu(Vec<f32>),
-    Gpu(Arc<wgpu::Buffer>),
-}
-
-impl TensorBuffer {
-    pub fn as_cpu_slice(&self) -> &[f32] {
-        match self {
-            TensorBuffer::Cpu(vec) => vec.as_slice(),
-            TensorBuffer::Gpu(_) => panic!(
-                "Attempted to read GPU tensor directly as CPU slice without staging readback."
-            ),
-        }
-    }
-
-    pub fn as_cpu_mut_slice(&mut self) -> &mut [f32] {
-        match self {
-            TensorBuffer::Cpu(vec) => vec.as_mut_slice(),
-            TensorBuffer::Gpu(_) => panic!("Attempted to mutate GPU tensor directly as CPU slice."),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct ParamTensor {
-    pub shape: Vec<usize>,
-    pub device: Device,
-    pub data: TensorBuffer,
-    pub grad: TensorBuffer,
-    pub m: TensorBuffer,
-    pub v: TensorBuffer,
-}
-
-impl ParamTensor {
-    pub fn new_cpu(shape: Vec<usize>, init_val: f32) -> Self {
-        let size: usize = shape.iter().product();
-        Self {
-            shape,
-            device: Device::Cpu,
-            data: TensorBuffer::Cpu(vec![init_val; size]),
-            grad: TensorBuffer::Cpu(vec![0.0; size]),
-            m: TensorBuffer::Cpu(vec![0.0; size]),
-            v: TensorBuffer::Cpu(vec![0.0; size]),
-        }
-    }
-
-    pub fn new_gpu(ctx: &WgpuContext, shape: Vec<usize>, init_data: &[f32]) -> Self {
-        let size: usize = shape.iter().product();
-        assert_eq!(size, init_data.len());
-
-        let data_buf = ctx.create_buffer_init("param_data", init_data, false);
-        let grad_buf = ctx.create_buffer_init("param_grad", &vec![0.0f32; size], false);
-        let m_buf = ctx.create_buffer_init("param_m", &vec![0.0f32; size], false);
-        let v_buf = ctx.create_buffer_init("param_v", &vec![0.0f32; size], false);
-
-        Self {
-            shape,
-            device: Device::Gpu(ctx.clone()),
-            data: TensorBuffer::Gpu(Arc::new(data_buf)),
-            grad: TensorBuffer::Gpu(Arc::new(grad_buf)),
-            m: TensorBuffer::Gpu(Arc::new(m_buf)),
-            v: TensorBuffer::Gpu(Arc::new(v_buf)),
-        }
-    }
-
-    pub fn zero_grad(&mut self) {
-        match &mut self.grad {
-            TensorBuffer::Cpu(vec) => vec.fill(0.0),
-            TensorBuffer::Gpu(buf) => {
-                if let Device::Gpu(ctx) = &self.device {
-                    let zero_vec = vec![0.0f32; self.shape.iter().product()];
-                    ctx.queue
-                        .write_buffer(buf, 0, bytemuck::cast_slice(&zero_vec));
-                }
-            }
-        }
     }
 }
