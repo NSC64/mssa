@@ -2320,7 +2320,7 @@ impl CLIHandler {
             "benchmark" => {
                 println!("Usage: {bin} benchmark [-f|--feature NAME] [-o|--out PATH]");
                 println!(
-                    "Features: continual, retention, geometry, refractory, ridge, bitnet, interdiffusion, sparse, or all."
+                    "Features: continual, retention, geometry, refractory, ridge, interdiffusion, sparse, or all."
                 );
                 println!(
                     "Interdiffusion compares from-scratch CPU learning in isolated method processes."

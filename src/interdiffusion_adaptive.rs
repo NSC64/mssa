@@ -692,6 +692,8 @@ impl InterdiffusionTrainer {
                 .iter()
                 .copied()
                 .fold(f32::NEG_INFINITY, f32::max) as f64;
+            let target_logit = self.forward.logits[target] as f64;
+            let target_exp = (target_logit - max).exp();
             let other = self
                 .forward
                 .logits
@@ -700,17 +702,31 @@ impl InterdiffusionTrainer {
                 .filter(|(i, _)| *i != target)
                 .map(|(_, &x)| (x as f64 - max).exp())
                 .sum::<f64>();
-            let sum = other + (self.forward.logits[target] as f64 - max).exp();
-            loss += cross_entropy_f64(&self.forward.logits, target);
+            let sum = other + target_exp;
+            // Reuse the same stabilized target/non-target partition for the
+            // CE, readout error, and diagonal curvature. The previous code
+            // recomputed the target exponential in CE and then recomputed
+            // every class exponential once for the error and once again for
+            // curvature.
+            loss += if target_logit == max {
+                other.ln_1p()
+            } else {
+                max - target_logit + sum.ln()
+            };
+            let target_error = -other / sum;
             for (r, &logit) in self.forward.logits.iter().enumerate() {
-                let error = if r == target {
-                    -other / sum
+                let probability = if r == target {
+                    target_exp / sum
                 } else {
                     (logit as f64 - max).exp() / sum
                 };
+                let error = if r == target {
+                    target_error
+                } else {
+                    probability
+                };
                 self.errors[r] = (error * scale) as f32;
                 if self.config.curvature_readout {
-                    let probability = (logit as f64 - max).exp() / sum;
                     let variance = probability
                         * if r == target {
                             other / sum

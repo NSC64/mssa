@@ -24,8 +24,6 @@ pub struct InferenceConfig {
     /// Use certified exact greedy output when the model has an index enabled.
     /// This is restricted to temperature-zero, no-repetition-penalty decoding.
     pub certified_greedy: bool,
-    /// Use the opt-in BitNet-style ternary output head when enabled on model.
-    pub bitnet_quantized: bool,
 }
 impl Default for InferenceConfig {
     fn default() -> Self {
@@ -36,7 +34,6 @@ impl Default for InferenceConfig {
             repetition_penalty: 1.25,
             max_new_tokens: 64,
             certified_greedy: false,
-            bitnet_quantized: false,
         }
     }
 }
@@ -340,8 +337,6 @@ impl<'a> PSSAInferenceEngine<'a> {
             && cfg.repetition_penalty == 1.0
             && !scored
             && self.model.certified_vocabulary_index.is_some();
-        let bitnet_quantized =
-            cfg.bitnet_quantized && !certified_greedy && self.model.bitnet_unembed.is_some();
         let mut logits = vec![0.0f32; d_v];
         let mut probs = vec![0.0f32; d_v];
         let mut candidates: Vec<(usize, f32)> = Vec::with_capacity(d_v);
@@ -359,8 +354,6 @@ impl<'a> PSSAInferenceEngine<'a> {
             }
             if certified_greedy {
                 self.model.forward_inference_features(id);
-            } else if bitnet_quantized {
-                self.model.forward_inference_bitnet(id, &mut logits)?;
             } else {
                 self.model.forward_inference(id, &mut logits);
             }
@@ -379,11 +372,7 @@ impl<'a> PSSAInferenceEngine<'a> {
                             // step; do not advance it twice.
                         } else {
                             let id = *generated_ids.last().expect("generated token");
-                            if bitnet_quantized {
-                                self.model.forward_inference_bitnet(id, &mut logits)?;
-                            } else {
-                                self.model.forward_inference(id, &mut logits);
-                            }
+                            self.model.forward_inference(id, &mut logits);
                         }
                     }
                     raw_confidence(&logits, &mut confidence);
@@ -456,11 +445,7 @@ impl<'a> PSSAInferenceEngine<'a> {
                     if step > 0 {
                         if !certified_greedy {
                             let id = *generated_ids.last().expect("generated token");
-                            if bitnet_quantized {
-                                self.model.forward_inference_bitnet(id, &mut logits)?;
-                            } else {
-                                self.model.forward_inference(id, &mut logits);
-                            }
+                            self.model.forward_inference(id, &mut logits);
                         }
                     }
                     raw_confidence(&logits, &mut confidence);

@@ -786,8 +786,6 @@ fn actual_numeric_storage(m: &PSSALayerV2) -> usize {
         inf_features,
         inf_block_out,
         certified_vocabulary_index: _,
-        bitnet_unembed: _,
-        bitnet_activation_q: _,
     } = m;
     matrix_bytes(embed_w)
         + matrix_bytes(unembed_w)
