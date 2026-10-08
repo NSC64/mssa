@@ -40,6 +40,9 @@ pub(crate) use benchmark::SEEDS as BENCHMARK_SEEDS;
 pub(crate) use benchmark::report as benchmark_report;
 pub(crate) use benchmark::{run as run_benchmark, worker as benchmark_worker};
 
+/// Opt-in research study workers used by `examples/research_studies.rs`.
+pub use benchmark::studies::run as run_research_study;
+
 pub struct ForwardModel {
     model: PSSALayerV2,
     logits: Vec<f32>,

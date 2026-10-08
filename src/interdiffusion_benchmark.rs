@@ -7,6 +7,9 @@ use super::*;
 use serde_json::{Value, json};
 use std::{fs, path::Path, process::Command, time::Instant};
 
+#[path = "research_studies.rs"]
+pub(crate) mod studies;
+
 const METHODS: [&str; 9] = [
     "adamw",
     "sgd",

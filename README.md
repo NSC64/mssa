@@ -72,6 +72,8 @@ The full protocols, raw-record schema, uncertainty treatment, and limitations
 are in [`docs/MEASURED_RESULTS.md`](docs/MEASURED_RESULTS.md),
 [`docs/INTERDIFFUSION.md`](docs/INTERDIFFUSION.md), and
 [`docs/COMPARISON.md`](docs/COMPARISON.md).
+The current four-study research run is documented in
+[`docs/RESEARCH_STUDIES.md`](docs/RESEARCH_STUDIES.md).
 
 ## Architecture
 
