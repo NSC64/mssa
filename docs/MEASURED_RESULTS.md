@@ -5,9 +5,9 @@ profile. These tables replace proxy-only performance statements with elapsed-tim
 measurements. They accompany the local, unpublished sparse-inference manuscript;
 the manuscript's **2.171x** is a conditional coordinate-work calculation.
 
-These CPU timing tables were captured before the upstream merge, from the
-research implementation committed as `91d3b28`. Upstream integration through
-`3544c97` is covered by the correctness checks below.
+The current tables were rerun after upstream integration using GCSR with four-slot
+memory groups. The benchmark source and raw JSON remain reproducible from the
+command below; timing artifacts are kept outside the repository.
 
 ## Reproduce
 
@@ -144,21 +144,27 @@ Build-inclusive single-batch speed is retained in the JSON.
 
 | Workload / mode | Pairs | Median tokens/s ↑ | Median paired wall speedup | CSR exact fallback | CVP full scan |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Trained bank / dense | 5 | 2,033 | 1.000x | — | — |
-| Trained bank / CSR | 5 | 1,937 | **0.943x** | **90.86%** | — |
-| Trained bank / CVP | 5 | 2,932 | **1.442x** | — | **0.16%** |
-| Trained bank / dual | 5 | 2,727 | **1.351x** | **90.86%** | **0.16%** |
-| Diffuse fixture / dense | 5 | 2,451 | 1.000x | — | — |
-| Diffuse fixture / dual | 5 | 2,186 | **0.884x** | **100.00%** | **100.00%** |
-| Separated fixture / dense | 5 | 2,456 | 1.000x | — | — |
-| Separated fixture / dual | 5 | 6,613 | **2.668x** | **0.00%** | **0.00%** |
+| Trained bank / dense | 5 | 1,610 | 1.000x | — | — |
+| Trained bank / CSR | 5 | 2,162 | **1.322x** | **0.00%** | — |
+| Trained bank / CVP | 5 | 2,416 | **1.504x** | — | **0.16%** |
+| Trained bank / dual | 5 | 3,837 | **2.411x** | **0.00%** | **0.16%** |
+| Held-out bank / dense | 5 | 1,922 | 1.000x | — | — |
+| Held-out bank / CSR | 5 | 1,831 | **1.000x** | **17.19%** | — |
+| Held-out bank / CVP | 5 | 2,891 | **1.567x** | — | **0.23%** |
+| Held-out bank / dual | 5 | 2,864 | **1.700x** | **17.19%** | **0.23%** |
+| Diffuse fixture / dense | 5 | 2,008 | 1.000x | — | — |
+| Diffuse fixture / CSR | 5 | 1,955 | **0.984x** | **100.00%** | — |
+| Diffuse fixture / dual | 5 | 1,876 | **0.970x** | **100.00%** | **100.00%** |
+| Separated fixture / dense | 5 | 1,919 | 1.000x | — | — |
+| Separated fixture / CSR | 5 | 2,283 | **1.189x** | **0.00%** | — |
+| Separated fixture / dual | 5 | 4,298 | **2.262x** | **0.00%** | **0.00%** |
 
-For the trained bank, paired CVP speeds range from 1.423x to 1.528x, and dual
-speeds from 1.338x to 1.446x. Median index construction costs are **0.059 ms**
-(CSR), **3.069 ms** (CVP), and **2.736 ms** (dual). Each is a separate measured
-build, so dual's median need not equal the sum of the other marginal medians.
-The indexes add 4,608 / 49,664 / 54,272 bytes of numeric Vec storage respectively;
-headers and allocator overhead are excluded.
+For the trained bank, median index construction costs are **3.892 ms** (CSR),
+**3.041 ms** (CVP), and **7.456 ms** (dual). Each is a separate measured build,
+so dual's median need not equal the sum of the other marginal medians. The
+trained-bank CSR build-inclusive speedup is **1.284x**; the held-out-bank value is
+**0.973x**, so the steady-state trained-bank gain does not establish a general
+held-out speedup.
 
 CSR termination means it certified omitted mass before scanning the full bank;
 fallback means exhaustive retrieval. CVP termination means at least one output
@@ -175,25 +181,31 @@ for every seed. Empty banks do not inflate the success rate.
   vocabulary. This is a small trained-model probe, not a representative LLM.
 - **Diffuse fixture:** randomly initialized weights and a random diffuse bank;
   tests the genuine all-fallback cost.
+- **Held-out bank:** trained and populated from the first five corpus lines, then
+  evaluated on the remaining four; it is the main check against replay-only
+  clustering behavior.
 - **Separated fixture:** deliberately engineered separated memory and vocabulary
-  rows; demonstrates the fast path, not trained-model generality. It uses 16-slot
-  memory clusters rather than the manuscript's hypothetical top-four support.
+  rows; demonstrates the fast path, not trained-model generality.
 
-Every workload/mode measured **100% greedy agreement** and **zero observed CE
-delta** against its dense model on the scored stream. CVP IDs are additionally
-checked against the exhaustive head on the identical features. Normalized CE
-always uses the full vocabulary projection: CVP currently certifies **greedy
-selection**, not normalized cross entropy or temperature sampling. Quality
-scoring is separate from the timed greedy batches.
+Every workload/mode measured **100% greedy agreement**. Trained-bank, diffuse,
+and separated rows had zero observed CE delta. Held-out GCSR's worst observed
+absolute CE delta was `1.628e-5`, with maximum actual omitted mass `2.929e-3`
+against a requested `0.01` bound and maximum absolute logit error `4.227e-2`.
+This is expected: the memory certificate bounds omitted retrieval softmax mass;
+it does not certify unchanged logits, cross-entropy, or sampled-token identity.
+CVP IDs are additionally checked against the exhaustive head on identical
+features. Normalized CE always uses the full vocabulary projection: CVP currently
+certifies **greedy selection**, not normalized cross entropy or temperature
+sampling. Quality scoring is separate from timed greedy batches.
 
 ### Does 2.171x survive?
 
-**Not on the trained-bank workload:** the measured dual speed is **1.351x**,
-with CSR fallback above 90%. The paper's proposed 1.5x practical inference
-acceptance threshold is also unmet there. CVP alone outperforms dual because CSR
-routing costs usually fail to buy useful sparsity. The diffuse path is slower
-than dense. Only the engineered separated fixture exceeds 2.171x in measured
-wall time; that cannot support a general trained-model claim.
+The current GCSR result is a measured trained-bank gain: CSR is **1.322x** and
+dual is **2.411x**. The held-out CSR row is only **1.000x** steady state and
+**0.973x** including index build, while diffuse CSR is slower than dense. The
+result therefore supports a replay-like trained-bank speedup, not a general
+trained-model claim. The historical `2.171x` number remains a conditional
+coordinate-work proxy rather than a universal throughput result.
 
 Repeated bound computation during sorting, redundant full-distance rescanning
 on fallback, and mixing values for omitted zero-weight rows were removed.
@@ -208,8 +220,8 @@ is independently measured and does not depend on certificate termination.
 
 ## Verification
 
-- After upstream integration, 421 library tests and all 190 integration tests
-  passed; two library and two manual timing tests were ignored.
+- After upstream integration, 424 library tests passed and two were ignored; all
+  190 integration tests passed in the serial verification run.
 - CUDA-feature release test compilation passed. Integration checks used release
   optimization with LTO disabled and 16 codegen units; the CPU timing tables
   above used the normal release profile.

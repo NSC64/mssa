@@ -872,7 +872,21 @@ fn summary(dir: &Path) -> Result<(), String> {
             )
             .unwrap();
         }
-        writeln!(out, "\nThe paper's 2.171x number is a conditional coordinate-work proxy. Use these measured wall-clock rows to assess it. All fallback events are included in throughput. Sparse inference adds index storage; reduced value-mixing work is separate from Interdiffusion's training-memory reduction. Raw batch timings, build-inclusive speed, per-seed fallback counts and repeated-query retrieval timing are in `sparse_inference.json`.\n\nReproduce: `{}`", v["reproduce_command"].as_str().unwrap()).unwrap();
+        if v["schema_version"]
+            .as_u64()
+            .is_some_and(|version| version >= 2)
+        {
+            writeln!(out, "\n### GCSR support and certificate audit\n\nHeld-out banks train/store only the first five corpus lines and query the remaining four. Every certified read is audited against the exhaustive reader. Backoff reads are exact fallback, never counted as sparse success.\n\n| Workload | Mode | Mean scanned slots | Mean mixed rows | Max actual omitted mass | Max certificate bound | Max logit error | Min greedy agreement | Build-inclusive speedup | Varied retrieval queries/s |\n| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |").unwrap();
+            for row in v["aggregate"].as_array().unwrap() {
+                writeln!(out, "| {} | {} | {:.2} | {:.2} | {:.3e} | {:.3e} | {:.3e} | {:.2}% | {:.3}x | {:.0} |",
+                    row["workload"].as_str().unwrap(), row["mode"].as_str().unwrap(),
+                    row["mean_scanned_slots"].as_f64().unwrap(), row["mean_value_rows_mixed"].as_f64().unwrap(),
+                    row["max_actual_omitted_mass"].as_f64().unwrap(), row["max_omitted_mass_bound"].as_f64().unwrap(),
+                    row["max_abs_logit_error"].as_f64().unwrap(), row["min_greedy_agreement"].as_f64().unwrap() * 100.0,
+                    row["median_build_inclusive_speedup"].as_f64().unwrap(), row["median_retrieval_queries_per_second"].as_f64().unwrap()).unwrap();
+            }
+        }
+        writeln!(out, "\nThe historical manuscript's 2.171x number is a conditional coordinate-work proxy. Use these measured wall-clock rows to assess it. All fallback events are included in throughput. Sparse inference adds index storage; reduced value-mixing work is separate from Interdiffusion's training-memory reduction. Raw batch timings, build-inclusive speed, per-seed fallback counts and retrieval timing are in `sparse_inference.json`.\n\nReproduce: `{}`", v["reproduce_command"].as_str().unwrap()).unwrap();
     }
     if let Some(v) = read_json(dir, "continual_learning") {
         writeln!(

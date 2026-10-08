@@ -13,6 +13,12 @@ use serde_json::json;
 use std::{fs, hint::black_box, path::Path, time::Instant};
 
 const MODES: [&str; 4] = ["dense", "csr", "cvp", "dual"];
+const WORKLOADS: [&str; 4] = [
+    "trained_bank",
+    "heldout_bank",
+    "diffuse_fixture",
+    "separated_fixture",
+];
 const REPEATS: usize = 5;
 const TOKENS: usize = 256;
 const EPSILON: f32 = 0.01;
@@ -27,7 +33,7 @@ fn install(model: &mut PSSALayerV2, mode: &str) -> Result<f64, String> {
     model.disable_certified_inference();
     let start = Instant::now();
     if mode == "csr" || mode == "dual" {
-        model.block.certified_memory_index = Some(CertifiedMemoryIndex::build(&model.memory, 16)?);
+        model.block.certified_memory_index = Some(CertifiedMemoryIndex::build(&model.memory, 4)?);
         model.block.certified_memory_epsilon = Some(EPSILON);
     }
     if mode == "cvp" || mode == "dual" {
@@ -66,11 +72,17 @@ fn fixture(seed: u64, workload: &str) -> Result<PSSALayerV2, String> {
         ..Default::default()
     };
     let mut model = PSSALayerV2::new(cfg, seed);
-    let bytes: Vec<_> = DatasetManager::SCIENCE_REFERENCE_CORPUS
-        .bytes()
-        .map(|b| b as usize + 1)
-        .collect();
-    if workload == "trained_bank" {
+    let training_text = if workload == "heldout_bank" {
+        DatasetManager::SCIENCE_REFERENCE_CORPUS
+            .lines()
+            .take(5)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        DatasetManager::SCIENCE_REFERENCE_CORPUS.to_owned()
+    };
+    let bytes: Vec<_> = training_text.bytes().map(|b| b as usize + 1).collect();
+    if workload == "trained_bank" || workload == "heldout_bank" {
         // The same byte IDs, fixed schedule and exposure for all frozen modes.
         for update in 0..32 {
             let start = update * 16 % (bytes.len() - 17);
@@ -128,14 +140,23 @@ fn fixture(seed: u64, workload: &str) -> Result<PSSALayerV2, String> {
 
 pub(super) fn run(dir: &Path) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let stream: Vec<_> = DatasetManager::SCIENCE_REFERENCE_CORPUS
-        .bytes()
-        .cycle()
-        .take(TOKENS + 1)
-        .map(|b| b as usize + 1)
-        .collect();
     let mut rows = Vec::new();
-    for workload in ["trained_bank", "diffuse_fixture", "separated_fixture"] {
+    for workload in WORKLOADS {
+        let evaluation_text = if workload == "heldout_bank" {
+            DatasetManager::SCIENCE_REFERENCE_CORPUS
+                .lines()
+                .skip(5)
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            DatasetManager::SCIENCE_REFERENCE_CORPUS.to_owned()
+        };
+        let stream: Vec<_> = evaluation_text
+            .bytes()
+            .cycle()
+            .take(TOKENS + 1)
+            .map(|b| b as usize + 1)
+            .collect();
         for seed in BENCHMARK_SEEDS {
             println!("Certified inference: {workload}, paired seed {seed}");
             let mut model = fixture(seed, workload)?;
@@ -180,18 +201,52 @@ pub(super) fn run(dir: &Path) -> Result<(), String> {
                 let mut vocab_fallback = 0;
                 let (mut slots, mut centers, mut mixes, mut exact_rows, mut centroids) =
                     (0, 0, 0, 0, 0);
+                let (mut bounds, mut bypasses, mut budget_fallbacks) = (0, 0, 0);
+                let mut max_omitted_mass = 0.0f64;
+                let mut max_mass_bound = 0.0f32;
+                let mut reference_val = vec![0.0; model.cfg.d_latent];
+                let mut reference_weights = vec![0.0; model.cfg.mem_capacity];
+                let mut queries = Vec::with_capacity(TOKENS * model.cfg.d_mem_key);
+                // Match the timed scheduler's warmup, including its history.
+                batch(&mut model, mode, &stream[..32], &mut logits)?;
                 let (mut loss, mut agree, mut max_logit_error) = (0.0, 0, 0.0f64);
                 for (i, &input) in stream[..TOKENS].iter().enumerate() {
                     if i % 32 == 0 {
                         model.reset_recurrent_state();
                     }
                     model.forward_inference(input, &mut logits);
+                    queries.extend_from_slice(&model.block.inf_q_pnc);
                     let m = &model.block.last_sparse_read_stats;
                     slots += m.scanned_slots;
                     centers += m.center_distance_evaluations;
+                    bounds += m.cluster_bound_evaluations;
+                    bypasses += usize::from(m.routing_bypassed);
+                    budget_fallbacks += usize::from(m.budget_fallback);
                     mixes += m.value_rows_mixed;
                     mem_cert += usize::from(m.certified);
                     mem_fallback += usize::from(m.exact_fallback);
+                    if m.certified {
+                        model.block.memory.retrieve_soft_into(
+                            &model.block.inf_q_pnc,
+                            model.block.cfg.tau_mem,
+                            &mut reference_val,
+                            &mut reference_weights,
+                        );
+                        let omitted: f64 = reference_weights
+                            .iter()
+                            .zip(&model.block.inf_mem_weights)
+                            .filter(|(_, sparse)| **sparse == 0.0)
+                            .map(|(&full, _)| full as f64)
+                            .sum();
+                        if omitted > m.omitted_mass_bound as f64 + 1e-7 {
+                            return Err(format!(
+                                "CSR omitted mass {omitted} exceeds certificate {}",
+                                m.omitted_mass_bound
+                            ));
+                        }
+                        max_omitted_mass = max_omitted_mass.max(omitted);
+                        max_mass_bound = max_mass_bound.max(m.omitted_mass_bound);
+                    }
                     let id = if *mode == "cvp" || *mode == "dual" {
                         let (id, stats) = model.certified_greedy_current()?;
                         vocab_cert += usize::from(stats.certified());
@@ -223,12 +278,15 @@ pub(super) fn run(dir: &Path) -> Result<(), String> {
                         .as_ref()
                         .map_or(0, CertifiedVocabularyIndex::numeric_storage_bytes);
                 let seconds = median(&samples[mode_id]);
+                // Cold routing state, varied actual recurrent queries; no
+                // repeated-query cache can inflate the retrieval measurement.
+                install(&mut model, mode)?;
                 let memory_start = Instant::now();
-                for _ in 0..TOKENS {
+                for query in queries.chunks_exact(model.cfg.d_mem_key) {
                     if let Some(index) = model.block.certified_memory_index.as_mut() {
                         index.retrieve_soft_into(
                             &model.block.memory,
-                            &model.block.inf_q_pnc,
+                            query,
                             model.block.cfg.tau_mem,
                             EPSILON,
                             &mut model.block.inf_m_val,
@@ -236,7 +294,7 @@ pub(super) fn run(dir: &Path) -> Result<(), String> {
                         )?;
                     } else {
                         model.block.memory.retrieve_soft_into(
-                            &model.block.inf_q_pnc,
+                            query,
                             model.block.cfg.tau_mem,
                             &mut model.block.inf_m_val,
                             &mut model.block.inf_mem_weights,
@@ -246,7 +304,7 @@ pub(super) fn run(dir: &Path) -> Result<(), String> {
                 }
                 let retrieval_seconds = memory_start.elapsed().as_secs_f64();
                 let work = 495_616.0
-                    + (slots + centers) as f64 / TOKENS as f64 * 32.0
+                    + (slots + centers + bounds) as f64 / TOKENS as f64 * 32.0
                     + mixes as f64 / TOKENS as f64 * 256.0
                     + (exact_rows + centroids) as f64 / TOKENS as f64 * 256.0;
                 rows.push(json!({"workload": workload, "seed": seed, "mode": mode,
@@ -256,12 +314,16 @@ pub(super) fn run(dir: &Path) -> Result<(), String> {
                     "index_build_seconds": build_seconds[mode_id], "additional_index_numeric_bytes": index_bytes,
                     "single_repeat_speedup_including_build": dense_seconds / (seconds + build_seconds[mode_id]),
                     "memory_certified_reads": mem_cert, "memory_exact_fallback_reads": mem_fallback,
+                    "memory_routing_bypassed_reads": bypasses, "memory_budget_fallback_reads": budget_fallbacks,
+                    "mean_memory_cluster_bound_evaluations": bounds as f64 / TOKENS as f64,
+                    "max_actual_omitted_mass": max_omitted_mass, "max_omitted_mass_bound": max_mass_bound,
                     "memory_fallback_rate": if *mode == "csr" || *mode == "dual" {Some(mem_fallback as f64 / TOKENS as f64)} else {None},
                     "vocabulary_certified_tokens": vocab_cert, "vocabulary_full_scan_tokens": vocab_fallback,
                     "vocabulary_fallback_rate": if *mode == "cvp" || *mode == "dual" {Some(vocab_fallback as f64 / TOKENS as f64)} else {None},
                     "mean_scanned_slots": slots as f64 / TOKENS as f64, "mean_exact_vocabulary_rows": exact_rows as f64 / TOKENS as f64,
-                    "retrieval_seconds_repeated_last_query": retrieval_seconds,
-                    "retrieval_queries_per_second_repeated_last_query": TOKENS as f64 / retrieval_seconds,
+                    "mean_value_rows_mixed": mixes as f64 / TOKENS as f64,
+                    "retrieval_seconds_varied_queries": retrieval_seconds,
+                    "retrieval_queries_per_second_varied_queries": TOKENS as f64 / retrieval_seconds,
                     "full_head_teacher_forced_cross_entropy": loss / TOKENS as f64,
                     "dense_cross_entropy": dense_loss, "cross_entropy_delta": loss / TOKENS as f64 - dense_loss,
                     "greedy_agreement": agree as f64 / TOKENS as f64, "max_abs_logit_error": max_logit_error,
@@ -270,7 +332,7 @@ pub(super) fn run(dir: &Path) -> Result<(), String> {
         }
     }
     let mut aggregate = Vec::new();
-    for workload in ["trained_bank", "diffuse_fixture", "separated_fixture"] {
+    for workload in WORKLOADS {
         for mode in MODES {
             let group: Vec<_> = rows
                 .iter()
@@ -296,20 +358,34 @@ pub(super) fn run(dir: &Path) -> Result<(), String> {
                 "min_paired_wall_clock_speedup": values("paired_wall_clock_speedup").into_iter().fold(f64::INFINITY, f64::min),
                 "max_paired_wall_clock_speedup": values("paired_wall_clock_speedup").into_iter().fold(0.0, f64::max),
                 "mean_memory_fallback_rate": mean("memory_fallback_rate"), "mean_vocabulary_fallback_rate": mean("vocabulary_fallback_rate"),
+                "mean_scanned_slots": mean("mean_scanned_slots"),
+                "mean_value_rows_mixed": mean("mean_value_rows_mixed"),
+                "mean_memory_routing_bypassed_reads": mean("memory_routing_bypassed_reads"),
+                "median_retrieval_queries_per_second": median(&values("retrieval_queries_per_second_varied_queries")),
+                "median_build_inclusive_speedup": median(&values("single_repeat_speedup_including_build")),
+                "min_build_inclusive_speedup": values("single_repeat_speedup_including_build").into_iter().fold(f64::INFINITY, f64::min),
+                "max_actual_omitted_mass": values("max_actual_omitted_mass").into_iter().fold(0.0, f64::max),
+                "max_omitted_mass_bound": values("max_omitted_mass_bound").into_iter().fold(0.0, f64::max),
+                "max_abs_logit_error": values("max_abs_logit_error").into_iter().fold(0.0, f64::max),
+                "max_abs_cross_entropy_delta": values("cross_entropy_delta").into_iter().map(f64::abs).fold(0.0, f64::max),
+                "min_greedy_agreement": values("greedy_agreement").into_iter().fold(1.0, f64::min),
                 "mean_cross_entropy_delta": mean("cross_entropy_delta"), "mean_greedy_agreement": mean("greedy_agreement"),
                 "median_index_build_seconds": median(&values("index_build_seconds")),
                 "mean_coordinate_work_proxy_speedup": mean("coordinate_work_proxy_speedup")}));
         }
     }
-    let record = json!({"experiment": "certified_sparse_inference_wall_clock", "backend": "cpu", "seeds": BENCHMARK_SEEDS,
+    let record = json!({"schema_version": 2, "experiment": "certified_sparse_inference_wall_clock", "backend": "cpu", "seeds": BENCHMARK_SEEDS,
         "reproduce_command": "cargo run --release -- benchmark --feature sparse --out __agent__/sparse_results",
-        "protocol": {"shape": {"vocab": 2048, "latent": 256, "state": 16, "key": 32, "populated_memory": 512},
+        "protocol": {"memory_method": "GCSR: four-slot geometric groups, interval lower bounds, suffix mass certificate, half-bank work budget and bounded exact-path backoff",
+            "shape": {"vocab": 2048, "latent": 256, "state": 16, "key": 32, "populated_memory": 512},
             "tokenizer": "UTF-8 byte+1 IDs, ID zero reserved; 2048 head rows for paper shape, unused byte-vocabulary rows retained",
             "training": "trained_bank: 32 AdamW updates x16 targets on built-in science corpus, constant lr0.003; same frozen weights for all inference modes",
+            "heldout": "heldout_bank: train and populate512 slots from first5 science lines only; evaluate last4 lines, never inserted or used for updates; same32 updates x16 targets and paired frozen weights",
             "fixtures": "diffuse_fixture and separated_fixture are untrained diagnostic stress cases; separated is engineered for pruning and cannot establish trained-model speed",
             "timing": "five rotated paired batches per seed, 256 forced input tokens, resets every32; includes model forward, retrieval, head/greedy and certificate routing; no index build or quality scoring in timed batch; build-inclusive metric separate",
             "fallback": "CSR failure to terminate before exhaustive scan; CVP failure to prune any vocabulary rows; empty banks excluded (all banks have512 slots)",
-            "quality": "teacher-forced exact full-head CE, including CSR changes; CVP is exact greedy only and does not compute a normalized distribution; all IDs checked against the same exhaustive head",
+            "quality": "teacher-forced exact full-head CE, including CSR changes; same routing warmup as timed runs; actual omitted mass checked against the full reader at every certified query; CVP is exact greedy only; all IDs checked against the same exhaustive head",
+            "retrieval_timing": "one cold-routing replay of256 varied actual recurrent queries captured during quality scoring; excludes SSM/head and index build; secondary diagnostic, not end-to-end speed",
             "limitation": "five paired synthetic/local-corpus CPU seeds; no large-corpus quality, sampled/top-K CVP, GPU or energy claim; certificate inference adds index storage rather than reducing trained parameter memory"},
         "aggregate": aggregate, "measurements": rows});
     fs::write(

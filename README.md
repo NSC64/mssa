@@ -78,8 +78,9 @@ and SiLU MLP.
 The implementation contains an opt-in certified inference path developed from
 the MSSA research direction:
 
-- `CertifiedMemoryIndex` clusters hyperbolic memory keys and computes a
-  conservative omitted-softmax-mass bound.
+- `CertifiedMemoryIndex` uses GCSR (geometric confidence-scheduled retrieval):
+  geometric groups, interval distance bounds, and a conservative
+  omitted-softmax-mass certificate. The benchmark uses four-slot groups.
 - If the requested memory certificate cannot be established, retrieval falls
   back to the exact full-bank reader.
 - `CertifiedVocabularyIndex` uses centroid/radius bounds to skip vocabulary
@@ -93,13 +94,14 @@ training rule or checkpoint format. The primary implementation is in
 [`src/pssa.rs`](src/pssa.rs) and generation routing in
 [`src/inference.rs`](src/inference.rs).
 
-The five-paired-seed CPU benchmark now measures wall-clock tokens/s and fallback
-rates at `V=2048`, width `256`, and `512` populated memory slots. On the small
-trained-bank workload, vocabulary-only certification measured `1.442x` paired
-speedup, while the dual path measured `1.351x`. CSR fell back on **90.86%** of
-queries and was slower alone (`0.943x`). The `2.171x` analytical coordinate-work
-proxy is therefore not an observed trained-model speedup. An engineered separated
-fixture measured `2.668x`; a diffuse fixture measured `0.884x`.
+The five-paired-seed CPU benchmark measures wall-clock tokens/s and fallback rates
+at `V=2048`, width `256`, and `512` populated memory slots. On the small
+trained-bank workload, GCSR measured `1.322x` paired speedup with 0% exact
+fallback; the dual GCSR+CVP path measured `2.411x`. On the held-out-bank split,
+GCSR measured `1.000x` with 17.19% fallback and `0.973x` including index build.
+The diffuse fixture measured `0.984x`, while the engineered separated fixture
+measured `1.189x`. These are local CPU measurements, not general speedup claims;
+the certificate bounds omitted memory softmax mass, not logits or cross-entropy.
 
 ```bash
 cargo run --release -- benchmark --feature sparse --out __agent__/sparse_results

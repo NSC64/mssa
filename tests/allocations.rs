@@ -100,6 +100,32 @@ fn stacked_depth_four_live_paths_allocate_nothing() {
     assert_live_paths_allocate_nothing(false, 4);
 }
 
+#[test]
+fn geometric_sparse_retrieval_and_exact_backoff_allocate_nothing() {
+    let mut bank = pssa::memory::HyperbolicEpisodicBankV2::new(64, 2, 16);
+    for i in 0..64 {
+        bank.insert(&[if i % 2 == 0 { 0.0 } else { 0.8 }, 0.0], &[0.25; 16]);
+    }
+    let mut index = pssa::sparse_inference::CertifiedMemoryIndex::build(&bank, 8).unwrap();
+    let (mut out, mut weights) = ([0.0; 16], [0.0; 64]);
+    warm_thread_local_counters();
+    start_counting();
+    for i in 0..80 {
+        index
+            .retrieve_soft_into(
+                &bank,
+                &[if i < 40 { 0.5 } else { 0.0 }, 0.0],
+                0.05,
+                0.01,
+                &mut out,
+                &mut weights,
+            )
+            .unwrap();
+    }
+    let counts = stop_counting();
+    assert_eq!(counts, (0, 0));
+}
+
 fn assert_live_paths_allocate_nothing(staged: bool, depth: usize) {
     // All model, state, input, output, and direct-memory-operation storage is
     // constructed before activation and excluded from the assertion.

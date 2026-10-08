@@ -1,10 +1,9 @@
 //! Exact, certificate-driven sparse inference helpers.
 //!
-//! The index is deliberately small and conservative.  Memory clusters use an
-//! existing key as their centre, so their radius is measured directly and can
-//! never be optimistic.  Vocabulary clusters store a centroid and the maximum
-//! row deviation.  Both readers fall back to exhaustive evaluation whenever a
-//! requested certificate cannot be proved.
+//! Memory keys are grouped geometrically, with interval distance bounds and a
+//! bounded sparse-work scheduler. Vocabulary clusters store a centroid and the
+//! maximum row deviation. Both readers fall back to exhaustive evaluation
+//! whenever a requested certificate cannot be proved.
 
 use crate::linalg::dot_slice;
 use crate::memory::HyperbolicEpisodicBankV2;
@@ -19,26 +18,33 @@ pub struct SparseReadStats {
     pub exact_fallback: bool,
     pub center_distance_evaluations: usize,
     pub value_rows_mixed: usize,
+    pub cluster_bound_evaluations: usize,
+    pub budget_fallback: bool,
+    pub routing_bypassed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct MemoryCluster {
-    center: Vec<f32>,
-    radius: f32,
-    center_sq: f32,
+    lower: Vec<f32>,
+    upper: Vec<f32>,
+    min_norm_sq: f32,
     start: usize,
     end: usize,
 }
 
-/// A conservative metric-ball index over the currently occupied memory slots.
+/// Geometric confidence-scheduled retrieval (GCSR) over occupied memory slots.
 /// The index is runtime-only and must be rebuilt after a memory write.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CertifiedMemoryIndex {
     dim_key: usize,
     count: usize,
     clusters: Vec<MemoryCluster>,
+    slots: Vec<usize>,
     order: Vec<usize>,
     lower_bounds: Vec<f64>,
+    tail_mass: Vec<f64>,
+    unprofitable_reads: usize,
+    dense_reads_remaining: usize,
 }
 
 impl CertifiedMemoryIndex {
@@ -46,39 +52,94 @@ impl CertifiedMemoryIndex {
         if cluster_size == 0 {
             return Err("certified memory cluster size must be positive".into());
         }
-        let mut clusters = Vec::new();
-        for start in (0..bank.count).step_by(cluster_size) {
-            let end = (start + cluster_size).min(bank.count);
-            // A stored key is a valid centre.  This costs no geometric mean
-            // calculation and makes the radius certificate straightforward.
-            let center = bank.keys[start * bank.dim_key..(start + 1) * bank.dim_key].to_vec();
-            let center_sq = bank.norm_sq[start];
-            let mut radius = 0.0f32;
-            for idx in start..end {
-                let off = idx * bank.dim_key;
-                radius = radius.max(HyperbolicEpisodicBankV2::poincare_distance(
-                    &center,
-                    center_sq,
-                    &bank.keys[off..off + bank.dim_key],
-                    bank.norm_sq[idx],
-                ));
+        let key_len = bank
+            .count
+            .checked_mul(bank.dim_key)
+            .ok_or("certified memory dimensions overflow")?;
+        if bank.dim_key == 0
+            || bank.count > bank.capacity
+            || bank.keys.len() < key_len
+            || bank.norm_sq.len() < bank.count
+            || bank.norm_sq[..bank.count]
+                .iter()
+                .any(|&s| !s.is_finite() || !(0.0..1.0).contains(&s))
+        {
+            return Err("certified memory bank has invalid dimensions or key norms".into());
+        }
+        // Farthest-first centres use the monotone argument of asinh, avoiding
+        // transcendental work during assignment. Identical keys stay together.
+        let mut nearest = vec![f64::INFINITY; bank.count];
+        let mut assignments = vec![0; bank.count];
+        let mut centers = 0;
+        for group in 0..bank.count.div_ceil(cluster_size) {
+            let center = (0..bank.count)
+                .max_by(|&a, &b| nearest[a].total_cmp(&nearest[b]).then_with(|| b.cmp(&a)))
+                .unwrap();
+            if nearest[center] == 0.0 {
+                break;
             }
-            clusters.push(MemoryCluster {
-                center,
-                radius,
-                center_sq,
-                start,
-                end,
-            });
+            let key = &bank.keys[center * bank.dim_key..(center + 1) * bank.dim_key];
+            for idx in 0..bank.count {
+                let other = &bank.keys[idx * bank.dim_key..(idx + 1) * bank.dim_key];
+                let squared: f64 = key
+                    .iter()
+                    .zip(other)
+                    .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+                    .sum();
+                let denom = (1.0 - bank.norm_sq[center] as f64) * (1.0 - bank.norm_sq[idx] as f64);
+                if !(squared.is_finite() && denom.is_finite() && denom > 0.0) {
+                    return Err(
+                        "certified memory keys must be finite and inside the open ball".into(),
+                    );
+                }
+                let distance = squared / denom;
+                if distance < nearest[idx] {
+                    nearest[idx] = distance;
+                    assignments[idx] = group;
+                }
+            }
+            centers += 1;
+        }
+        let mut clusters = Vec::new();
+        let mut slots = Vec::with_capacity(bank.count);
+        for group in 0..centers {
+            let start = slots.len();
+            slots.extend((0..bank.count).filter(|&idx| assignments[idx] == group));
+            let end = slots.len();
+            for offset in (start..end).step_by(cluster_size) {
+                let stop = (offset + cluster_size).min(end);
+                let mut lower = vec![f32::INFINITY; bank.dim_key];
+                let mut upper = vec![f32::NEG_INFINITY; bank.dim_key];
+                let mut min_norm_sq = f32::INFINITY;
+                for &idx in &slots[offset..stop] {
+                    min_norm_sq = min_norm_sq.min(bank.norm_sq[idx]);
+                    for j in 0..bank.dim_key {
+                        let key = bank.keys[idx * bank.dim_key + j];
+                        lower[j] = lower[j].min(key);
+                        upper[j] = upper[j].max(key);
+                    }
+                }
+                clusters.push(MemoryCluster {
+                    lower,
+                    upper,
+                    min_norm_sq,
+                    start: offset,
+                    end: stop,
+                });
+            }
         }
         let order = (0..clusters.len()).collect();
         let lower_bounds = vec![0.0; clusters.len()];
         Ok(Self {
             dim_key: bank.dim_key,
             count: bank.count,
+            tail_mass: vec![0.0; clusters.len() + 1],
             clusters,
+            slots,
             order,
             lower_bounds,
+            unprofitable_reads: 0,
+            dense_reads_remaining: 0,
         })
     }
 
@@ -93,10 +154,12 @@ impl CertifiedMemoryIndex {
     pub fn numeric_storage_bytes(&self) -> usize {
         self.clusters
             .iter()
-            .map(|c| c.center.capacity() * 4)
+            .map(|c| (c.lower.capacity() + c.upper.capacity()) * 4)
             .sum::<usize>()
             + self.order.capacity() * std::mem::size_of::<usize>()
             + self.lower_bounds.capacity() * 8
+            + self.slots.capacity() * std::mem::size_of::<usize>()
+            + self.tail_mass.capacity() * 8
     }
 
     /// Read with a certified upper bound on omitted softmax mass.
@@ -138,16 +201,36 @@ impl CertifiedMemoryIndex {
         if !(q_sq.is_finite() && q_sq < 1.0) {
             return Err("certified memory query must be in the open Poincare ball".into());
         }
+        if epsilon == 0.0 || self.clusters.len() < 2 || self.dense_reads_remaining > 0 {
+            self.dense_reads_remaining = self.dense_reads_remaining.saturating_sub(1);
+            bank.retrieve_soft_into(q_pnc, tau, out_val, out_weights);
+            out_weights[bank.count..].fill(0.0);
+            return Ok(SparseReadStats {
+                scanned_slots: bank.count,
+                populated_slots: bank.count,
+                value_rows_mixed: bank.count,
+                exact_fallback: true,
+                routing_bypassed: true,
+                ..Default::default()
+            });
+        }
         out_weights[..bank.count].fill(f32::NAN);
         for (bound, cluster) in self.lower_bounds.iter_mut().zip(&self.clusters) {
-            let distance = HyperbolicEpisodicBankV2::poincare_distance(
-                q_pnc,
-                q_sq,
-                &cluster.center,
-                cluster.center_sq,
-            ) as f64;
-            let guard = 8.0 * f32::EPSILON as f64 * (distance.abs() + cluster.radius as f64 + 1.0);
-            *bound = (distance - cluster.radius as f64 - guard).max(0.0);
+            // Direct interval bounds use the dense reader's cached FP32 norms;
+            // no triangle inequality for a rounded pseudo-metric is assumed.
+            let squared: f64 = q_pnc
+                .iter()
+                .zip(&cluster.lower)
+                .zip(&cluster.upper)
+                .map(|((&q, &lo), &hi)| {
+                    let delta = (lo as f64 - q as f64).max(q as f64 - hi as f64).max(0.0);
+                    delta * delta
+                })
+                .sum();
+            let denom = (1.0 - q_sq as f64) * (1.0 - cluster.min_norm_sq as f64);
+            let distance = 2.0 * (squared / denom).sqrt().asinh();
+            let guard = 8.0 * f32::EPSILON as f64 * (distance + 1.0);
+            *bound = (distance - guard).max(0.0);
         }
         self.order.sort_unstable_by(|&a, &b| {
             self.lower_bounds[a]
@@ -155,14 +238,26 @@ impl CertifiedMemoryIndex {
                 .then_with(|| a.cmp(&b))
         });
 
-        let mut scanned_clusters = 0usize;
+        // One common shift and a suffix sum replace quadratic tail rescans and
+        // per-slot rescaling. Underflow cannot accept an empty observed mass.
+        let reference = self.lower_bounds[self.order[0]];
+        self.tail_mass[self.order.len()] = 0.0;
+        for position in (0..self.order.len()).rev() {
+            let id = self.order[position];
+            let cluster = &self.clusters[id];
+            self.tail_mass[position] = self.tail_mass[position + 1]
+                + (cluster.end - cluster.start) as f64
+                    * ((reference - self.lower_bounds[id]) / tau as f64).exp();
+        }
         let mut scanned_slots = 0usize;
         let mut min_scanned = f32::INFINITY;
-        let mut omitted_bound = 1.0f32;
+        let mut omitted_bound = 1.0;
         let mut scanned_mass = 0.0f64;
-        for &cluster_id in &self.order {
+        let mut certified = false;
+        let mut budget_fallback = false;
+        for (position, &cluster_id) in self.order.iter().enumerate() {
             let cluster = &self.clusters[cluster_id];
-            for idx in cluster.start..cluster.end {
+            for &idx in &self.slots[cluster.start..cluster.end] {
                 let off = idx * bank.dim_key;
                 let dist = HyperbolicEpisodicBankV2::poincare_distance(
                     q_pnc,
@@ -171,50 +266,54 @@ impl CertifiedMemoryIndex {
                     bank.norm_sq[idx],
                 );
                 out_weights[idx] = dist;
-                if dist < min_scanned {
-                    scanned_mass *= ((dist as f64 - min_scanned as f64) / tau as f64).exp();
-                    min_scanned = dist;
-                }
-                scanned_mass += ((min_scanned as f64 - dist as f64) / tau as f64).exp();
+                min_scanned = min_scanned.min(dist);
+                scanned_mass += ((reference - dist as f64) / tau as f64).exp();
                 scanned_slots += 1;
             }
-            scanned_clusters += 1;
-
-            // Shift both scanned and unscanned terms by the nearest scanned
-            // distance.  This is the same stable softmax as the full reader,
-            // with a conservative upper bound for every unscanned cluster.
-            let mut unscanned_mass = 0.0f64;
-            for &other_id in &self.order[scanned_clusters..] {
-                let other = &self.clusters[other_id];
-                unscanned_mass += (other.end - other.start) as f64
-                    * ((min_scanned as f64 - self.lower_bounds[other_id]) / tau as f64).exp();
+            let unscanned_mass = self.tail_mass[position + 1];
+            if scanned_mass > 0.0 && position + 1 < self.order.len() {
+                omitted_bound = (unscanned_mass / (scanned_mass + unscanned_mass)
+                    + 16.0 * f32::EPSILON as f64)
+                    .min(1.0) as f32;
+                if omitted_bound <= epsilon {
+                    certified = true;
+                    break;
+                }
             }
-            omitted_bound = if unscanned_mass == 0.0 {
-                0.0
-            } else if !unscanned_mass.is_finite() {
-                1.0
-            } else {
-                (unscanned_mass / (scanned_mass + unscanned_mass) + 8.0 * f32::EPSILON as f64)
-                    .min(1.0) as f32
-            };
-            if epsilon > 0.0 && omitted_bound <= epsilon {
+            if scanned_slots >= bank.count / 2 {
+                budget_fallback = position + 1 < self.order.len();
                 break;
             }
         }
 
-        let certified =
-            epsilon > 0.0 && omitted_bound <= epsilon && scanned_clusters < self.clusters.len();
-        let exact_fallback = !certified;
-        if exact_fallback {
+        if !certified {
             // Preserve the production reader's accumulation order and bits on
             // fallback.  This is also the safety valve for diffuse banks.
-            // Distances are already exact. Reuse them with the production
-            // reader's FP32 accumulation order instead of scanning twice.
+            // Reuse verified slots and finish only the missing distances.
+            for (idx, distance) in out_weights[..bank.count].iter_mut().enumerate() {
+                if distance.is_nan() {
+                    *distance = HyperbolicEpisodicBankV2::poincare_distance(
+                        q_pnc,
+                        q_sq,
+                        &bank.keys[idx * bank.dim_key..(idx + 1) * bank.dim_key],
+                        bank.norm_sq[idx],
+                    );
+                    min_scanned = min_scanned.min(*distance);
+                }
+            }
+            self.unprofitable_reads += 1;
+            if self.unprofitable_reads >= 3 {
+                // ponytail: fixed bounded backoff; profile-based scheduling if
+                // future deployments need hardware/load-specific calibration.
+                self.dense_reads_remaining = 31;
+                self.unprofitable_reads = 0;
+            }
             let mut sum = 0.0f32;
             for w in &mut out_weights[..bank.count] {
                 *w = ((min_scanned - *w) / tau).exp();
                 sum += *w;
             }
+            out_weights[bank.count..].fill(0.0);
             out_val.fill(0.0);
             for idx in 0..bank.count {
                 let weight = out_weights[idx] / sum;
@@ -229,10 +328,14 @@ impl CertifiedMemoryIndex {
                 omitted_mass_bound: 0.0,
                 certified: false,
                 exact_fallback: true,
-                center_distance_evaluations: self.clusters.len(),
                 value_rows_mixed: bank.count,
+                cluster_bound_evaluations: self.clusters.len(),
+                budget_fallback,
+                ..Default::default()
             });
         }
+
+        self.unprofitable_reads = 0;
 
         let mut sum = 0.0f64;
         for weight in &mut out_weights[..bank.count] {
@@ -263,9 +366,10 @@ impl CertifiedMemoryIndex {
             populated_slots: bank.count,
             omitted_mass_bound: omitted_bound,
             certified,
-            exact_fallback,
-            center_distance_evaluations: self.clusters.len(),
+            exact_fallback: false,
             value_rows_mixed,
+            cluster_bound_evaluations: self.clusters.len(),
+            ..Default::default()
         })
     }
 }
@@ -482,7 +586,8 @@ mod tests {
         assert!(stats.certified);
         assert_eq!(stats.scanned_slots, 1); // final short cluster visited first
         assert_eq!(stats.value_rows_mixed, 1);
-        assert_eq!(stats.center_distance_evaluations, 3);
+        assert_eq!(stats.center_distance_evaluations, 0);
+        assert_eq!(stats.cluster_bound_evaluations, 3);
         let exact = index
             .retrieve_soft_into(&bank, &[0.0, 0.0], 0.05, 0.0, &mut out, &mut weights)
             .unwrap();
@@ -577,6 +682,86 @@ mod tests {
         assert!(stats.exact_fallback);
         assert_eq!(sparse, full);
         assert_eq!(sparse_weights, full_weights);
+    }
+
+    #[test]
+    fn geometric_certificates_bound_actual_omitted_mass_for_interleaved_keys() {
+        let mut bank = HyperbolicEpisodicBankV2::new(64, 2, 3);
+        let centers = [[0.0, 0.0], [0.7, 0.0], [-0.4, 0.6], [0.99999, 0.0]];
+        for i in 0..64 {
+            let mut key = centers[i % centers.len()];
+            key[1] += (i / 4) as f32 * 1e-6;
+            bank.insert(&key, &[i as f32 / 64.0, -0.5, (i % 7) as f32]);
+        }
+        let mut certificates = 0;
+        for query in centers {
+            for tau in [0.04, 0.3, 10.0, f32::MIN_POSITIVE] {
+                let mut index = CertifiedMemoryIndex::build(&bank, 8).unwrap();
+                let (mut sparse, mut full) = ([0.0; 3], [0.0; 3]);
+                let (mut weights, mut reference) = ([0.0; 64], [0.0; 64]);
+                let stats = index
+                    .retrieve_soft_into(&bank, &query, tau, 0.01, &mut sparse, &mut weights)
+                    .unwrap();
+                bank.retrieve_soft_into(&query, tau, &mut full, &mut reference);
+                if stats.certified {
+                    certificates += 1;
+                    let omitted: f64 = reference
+                        .iter()
+                        .zip(weights)
+                        .filter(|(_, sparse)| *sparse == 0.0)
+                        .map(|(&full, _)| full as f64)
+                        .sum();
+                    assert!(
+                        omitted <= stats.omitted_mass_bound as f64 + 1e-7,
+                        "omitted {omitted} exceeds {:?}",
+                        stats
+                    );
+                    for (&a, b) in sparse.iter().zip(full) {
+                        assert!((a - b).abs() <= 12.0 * stats.omitted_mass_bound + 2e-5);
+                    }
+                } else {
+                    assert_eq!(sparse, full);
+                    assert_eq!(weights, reference);
+                }
+            }
+        }
+        assert!(certificates >= 4);
+    }
+
+    #[test]
+    fn costly_routing_backs_off_exactly_then_retries_a_changed_query() {
+        let mut bank = HyperbolicEpisodicBankV2::new(64, 2, 2);
+        for i in 0..64 {
+            bank.insert(
+                &[if i % 2 == 0 { 0.0 } else { 0.8 }, 0.0],
+                &[i as f32, -1.0],
+            );
+        }
+        let mut index = CertifiedMemoryIndex::build(&bank, 8).unwrap();
+        let (mut out, mut weights) = ([0.0; 2], [0.0; 64]);
+        let (mut reference, mut full_weights) = ([0.0; 2], [0.0; 64]);
+        bank.retrieve_soft_into(&[0.5, 0.0], 0.05, &mut reference, &mut full_weights);
+        for _ in 0..3 {
+            let stats = index
+                .retrieve_soft_into(&bank, &[0.5, 0.0], 0.05, 0.01, &mut out, &mut weights)
+                .unwrap();
+            assert!(stats.exact_fallback && stats.budget_fallback);
+            assert_eq!(out, reference);
+            assert_eq!(weights, full_weights);
+        }
+        for _ in 0..31 {
+            let stats = index
+                .retrieve_soft_into(&bank, &[0.5, 0.0], 0.05, 0.01, &mut out, &mut weights)
+                .unwrap();
+            assert!(stats.exact_fallback && stats.routing_bypassed);
+            assert_eq!(stats.cluster_bound_evaluations, 0);
+            assert_eq!(out, reference);
+        }
+        let stats = index
+            .retrieve_soft_into(&bank, &[0.0, 0.0], 0.05, 0.01, &mut out, &mut weights)
+            .unwrap();
+        assert!(stats.certified && !stats.routing_bypassed);
+        assert_eq!(stats.scanned_slots, 32);
     }
 
     #[test]
