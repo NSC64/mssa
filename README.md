@@ -10,7 +10,7 @@ evaluation, and reproducible benchmarking.
 MSSA is maintained as a research fork of
 [PSSA (Plastic State-Space Architecture)](https://github.com/Sparticle62ops/pssa),
 created by [Sparticle62ops](https://github.com/Sparticle62ops). The active fork is
-[Grego1801/mssa](https://github.com/Grego1801/mssa). The selective recurrence,
+[NSC64/mssa](https://github.com/NSC64/mssa). The selective recurrence,
 episodic memory, plastic adapters, training infrastructure, accelerator
 backends, and terminal interface are derived from the upstream implementation.
 MSSA extends this foundation with experimental certified sparse inference,
@@ -25,6 +25,8 @@ long-lived episodic information to be stored and retrieved.
 > package, executable, checkpoint extension, and several source paths retain
 > the historical `pssa` names. The examples use `cargo run --release` and
 > therefore do not require an installed executable.
+
+![The upstream PSSA terminal dashboard during a live training run](docs/img/tui-demo.gif)
 
 ## Design
 
@@ -175,7 +177,7 @@ API, state handling, complete protocol, and measured quality/time trade-offs.
 Obtain this fork:
 
 ```bash
-git clone https://github.com/Grego1801/mssa.git
+git clone https://github.com/NSC64/mssa.git
 cd mssa
 ```
 
@@ -227,6 +229,28 @@ cargo run --release -- train data/corpus.txt \
   --resume runs/ck01.pssa --epochs 1 --out runs/ck02.pssa
 ```
 
+### Token cache and dream replay
+
+Upstream's persistent token cache is opt-in. Reuse `--token-cache PATH` across
+corpus windows to avoid retokenizing the full source. Cache contents are
+validated against the source fingerprint and tokenizer identity; invalid caches
+are rebuilt serially.
+
+```bash
+cargo run --release -- train data/corpus.txt \
+  --token-cache data/corpus.txt.tok \
+  --out runs/model.pssa
+```
+
+The experimental sleep phase is also off by default. `--dream-every N` replays
+up to `--dream-replay K` occupied entries after every N optimizer updates.
+`--dream-mode memory|generate|both` selects stored values, generated sequences,
+or both; `--dream-len` controls generated sequence length. Replay currently
+updates only the plastic adapters and preserves live recurrent carry. Its
+sequential-task probe did not establish reduced forgetting. Dream controls are
+runtime-only and must be repeated on resume. GPU runs synchronize weights around
+the host-only replay phase.
+
 Important training defaults:
 
 | Option | Default | Meaning |
@@ -242,6 +266,11 @@ Important training defaults:
 | `--seed` | `42` | Initialization seed. |
 | `--tokenizer` | `bpe` | `bpe` or `word`. |
 | `--backend` | `auto` | `auto`, `cpu`, `webgpu`, or `cuda`. |
+| `--token-cache` | off | Persistent token-window cache path. |
+| `--dream-every` | `0` | Offline replay cadence; zero disables it. |
+| `--dream-replay` | `32` | Maximum memory entries/seeds per replay. |
+| `--dream-mode` | `memory` | Replay source. |
+| `--dream-len` | `64` | Generated tokens per memory seed. |
 
 For bounded divergence containment, the runtime-only options
 `--grad-clip 1.0` and `--memory-value-cap 512` can be enabled. Repeat these
@@ -327,8 +356,41 @@ The TUI provides:
 - Hardware/device information and backend selection.
 - Dataset library, corpus mixing, sweeps, and run timeline views.
 
-Press `Tab` to change views, `Ctrl+K` to open the command palette, and `F1` or
-`?` for keyboard help. See:
+Pipe a headless training run into the dashboard to watch it live:
+
+```bash
+cargo run --release -- train data/corpus.txt \
+  --out runs/ck001.pssa --backend cpu --no-tui \
+  | target/release/pssa tui --chain runs
+```
+
+**Monitor:** loss, speed, ETA, optimizer progress, and memory occupancy.
+Press `g` or `1`–`7` to switch graphs and `+`/`-` to zoom. Graph `7` plots
+occupied episodic slots on the Poincare disk.
+
+![Monitor tab: live loss curve and run metrics](docs/img/tui-monitor.png)
+![Monitor tab: episodic memory occupancy](docs/img/tui-memory.png)
+
+**Inference:** chat with checkpoints; `/model PATH` loads one, and `/temp`,
+`/top-p`, `/top-k`, `/max-tokens`, and `/repetition-penalty` change sampling.
+`/ab` compares MSSA with the transformer baseline; `F6` colors token confidence.
+
+![Inference tab: chatting with a checkpoint](docs/img/tui-chat.png)
+
+**Setup:** the wizard selects the dataset, model, depth/loops, schedule, and
+backend, and displays the equivalent CLI command. Model, chain, and feed views
+show the run configuration, checkpoints, and streamed training tokens.
+
+![Setup tab: new-run wizard with the equivalent CLI command](docs/img/tui-setup.png)
+![Model tab: run configuration](docs/img/tui-model.png)
+
+Press `Tab` to change views and `Ctrl+K` to open the command palette. `F8` shows
+hardware telemetry, `F9` selects the device, `F10` sets resource limits, and
+`F11` opens the math reference. `F1` or `?` shows keyboard help.
+
+![Key reference overlay](docs/img/tui-keys.png)
+
+See:
 
 - [`docs/training-setup.md`](docs/training-setup.md)
 - [`docs/TUI-EXTRAS.md`](docs/TUI-EXTRAS.md)
@@ -391,6 +453,9 @@ Checkpoint repair and compatibility tests live in
 | --- | --- |
 | `src/pssa.rs` | MSSA model, recurrence, memory integration, plasticity, and training. |
 | `src/memory.rs` | Hyperbolic episodic memory bank. |
+| `src/dream.rs` | Experimental offline replay modes and summaries. |
+| `src/token_cache.rs` | Validated persistent token windows and serial cache construction. |
+| `src/wgpu_stages.rs` | WebGPU recurrent scan and memory training stages. |
 | `src/sparse_inference.rs` | Certified memory and vocabulary inference indexes. |
 | `src/sparse_benchmark.rs` | Paired wall-clock throughput, certificate fallback, and fidelity measurements. |
 | `src/bitnet.rs` | Experimental packed ternary inference primitives. |
@@ -402,6 +467,7 @@ Checkpoint repair and compatibility tests live in
 | `src/inference.rs` | Generation and sampling APIs. |
 | `src/feature_benchmark.rs` | Deterministic feature benchmarks. |
 | `src/tui/` | Terminal interface. |
+| `scripts/tui_audit_pty.py` | Isolated headless terminal audit driver. |
 | `tests/` | Numerical, checkpoint, backend, and interface tests. |
 
 ## Project status
@@ -414,6 +480,13 @@ measurements remain future work. Interdiffusion v2 improves the measured CPU
 memory/recall-quality trade-off, with strict per-seed parity and broader training
 quality still research objectives.
 
+Upstream's WebGPU recurrent and memory training stages are integrated, including
+packed document lanes. Small CPU/WebGPU forward and gradient parity tests and
+training-shape dispatch checks pass on an NVIDIA GeForce 940MX; corpus-scale
+training and accelerator throughput remain unmeasured. Software adapters are
+refused by default. Dream replay is experimental, off by default, and currently
+limited to adapter updates. Text quality at this prototype scale remains poor.
+
 ## Attribution and community
 
 The original PSSA architecture and implementation are credited to
@@ -422,7 +495,7 @@ Historical upstream results are documented in the
 [PSSA repository](https://github.com/Sparticle62ops/pssa); they should be evaluated
 under their reported configurations and protocols.
 
-- MSSA issues and contributions: [Grego1801/mssa](https://github.com/Grego1801/mssa/issues).
+- MSSA issues and contributions: [NSC64/mssa](https://github.com/NSC64/mssa/issues).
 - Upstream source and documentation: [Sparticle62ops/pssa](https://github.com/Sparticle62ops/pssa).
 - Upstream PSlabs community: [Discord](https://discord.gg/9sqfKeqWYF).
 

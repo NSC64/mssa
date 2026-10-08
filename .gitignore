@@ -26,3 +26,7 @@ docs/PROJECT-HANDOFF-*
 
 # Local manuscript retained until publication
 /paper.pdf
+
+# agent scratch notes, keep out of the repo
+*_FINDINGS.md
+FINDINGS*.md

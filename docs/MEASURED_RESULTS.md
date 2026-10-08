@@ -5,6 +5,10 @@ profile. These tables replace proxy-only performance statements with elapsed-tim
 measurements. They accompany the local, unpublished sparse-inference manuscript;
 the manuscript's **2.171x** is a conditional coordinate-work calculation.
 
+These CPU timing tables were captured before the upstream merge, from the
+research implementation committed as `91d3b28`. Upstream integration through
+`3544c97` is covered by the correctness checks below.
+
 ## Reproduce
 
 ```bash
@@ -204,10 +208,18 @@ is independently measured and does not depend on certificate termination.
 
 ## Verification
 
-- 404 library tests passed, two ignored, plus 68 focused integration tests.
-- Default and CUDA-feature release test compilation passed.
+- After upstream integration, 421 library tests and all 190 integration tests
+  passed; two library and two manual timing tests were ignored.
+- CUDA-feature release test compilation passed. Integration checks used release
+  optimization with LTO disabled and 16 codegen units; the CPU timing tables
+  above used the normal release profile.
 - Tests cover curvature versus finite differences, projected derivatives versus
   TBPTT, failed-update rollback, sparse scan counts, exact fallback accumulation,
-  and CVP agreement with SIMD dense logits across five random seeds.
+   and CVP agreement with SIMD dense logits across five random seeds.
+- WebGPU forward/gradient parity, packed-lane parity, and strict training-shape
+  forward/backward dispatch passed on an NVIDIA GeForce 940MX using Vulkan.
+  Shader syntax is also validated without requiring an adapter. Integration
+  fixed invalid shader syntax, storage-buffer limits, recurrent-stage bindings,
+  and unused EGL backend discovery during concurrent/live-context initialization.
 - No accelerator speed, energy, long-form corpus quality, or universal per-seed
   improvement is established by these local CPU experiments.

@@ -9,7 +9,7 @@ use crate::{
     pssa::{PSSAConfigV2, PSSALayerV2},
     sparse_inference::{CertifiedMemoryIndex, CertifiedVocabularyIndex},
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{fs, hint::black_box, path::Path, time::Instant};
 
 const MODES: [&str; 4] = ["dense", "csr", "cvp", "dual"];

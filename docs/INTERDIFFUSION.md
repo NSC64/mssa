@@ -415,9 +415,12 @@ keys, accounted fallback workspace growth, bounded input-row budgets, and
 frequency coverage under sparse token visits. Matched-quality reporting tests
 require both loss and accuracy and preserve missing targets.
 
-The verified suite passed 404 library tests (two ignored), plus 68 focused
-checkpoint/depth/loop/training integration tests. Default and CUDA-feature
-release test compilation also passed; this does not measure accelerator speed.
+After upstream integration, the verified suite passed 421 library tests and all
+190 integration tests (two library and two manual timing tests ignored).
+CUDA-feature release test compilation also passed. Validation used release
+optimization with LTO disabled and 16 codegen units; measured timing tables use
+the normal release profile. WebGPU checks exercise the upstream trainer, while
+Interdiffusion remains CPU-only.
 
 ```bash
 cargo test --release --lib interdiffusion::
