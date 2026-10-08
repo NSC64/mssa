@@ -13,6 +13,7 @@ pub mod evaluation;
 pub mod feature_benchmark;
 pub mod gpu_batch;
 pub mod inference;
+pub mod interdiffusion;
 pub mod linalg;
 pub mod loss_csv;
 pub mod memory;

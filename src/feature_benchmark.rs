@@ -1,6 +1,7 @@
 //! Small, deterministic feature measurements built on the verification benchmark
 //! command.  The experiments intentionally use the public scalar/reference APIs:
-//! they are not a second training harness and do not alter default PSSA behavior.
+//! they do not alter default PSSA behavior. Interdiffusion uses a separate,
+//! explicitly opt-in tape-free research runtime and isolated worker processes.
 
 use crate::adapter::PlasticAdapterV2;
 use crate::memory::HyperbolicEpisodicBankV2;
@@ -11,6 +12,9 @@ use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+#[path = "sparse_benchmark.rs"]
+mod sparse_benchmark;
 
 const DEFAULT_OUTPUT: &str = "__agent__/feature_results";
 const REPRO_ROOT: &str = "/workspace/pssa";
@@ -782,6 +786,94 @@ fn summary(dir: &Path) -> Result<(), String> {
         )
         .unwrap();
     }
+    if let Some(v) = read_json(dir, "interdiffusion") {
+        let mut cells = Vec::new();
+        if let Some(workers) = v["workers"].as_array() {
+            for worker in workers {
+                cells.push(format!(
+                    "{}: CLI-shape numeric bytes {}, peak process RSS {} KiB",
+                    worker["method"].as_str().unwrap_or("?"),
+                    worker["cli_shape_storage"]["numeric_storage_bytes"],
+                    worker["process_peak_rss_kib"]
+                ));
+            }
+        }
+        writeln!(out, "| Interdiffusion tape-free learning | {}; task/seed losses and learning curves in interdiffusion.json | `{}` |",
+            cells.join("; "), v["reproduce_command"].as_str().unwrap_or("")).unwrap();
+        if let Some(rows) = v["aggregate_quality"].as_array() {
+            writeln!(out, "\n## Interdiffusion quality and matched-quality time\n\nThe target is each seed's development-selected AdamW final development loss plus 5%, with at least its final development last-token accuracy. Times are the first sampled match (128-update resolution), including development evaluation. Test data never select the learning rate or time target. A speedup is reported only when all seeds reach the target; zero seconds means the target already held at initialization.\n\n| Method | Task | Mean test CE | Mean last-token accuracy | Dev target reached | Final test matches AdamW (5% CE tolerance + accuracy) | Median seconds to dev target (successful seeds) | Median paired speedup (all seeds) | Median LR-grid training seconds |\n| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |").unwrap();
+            for row in rows {
+                let seconds = row["median_seconds_to_adamw_quality_successful_seeds"]
+                    .as_f64()
+                    .map_or("—".into(), |x| format!("{x:.4}"));
+                let speedup = row["median_paired_speedup_over_adamw_all_seeds"]
+                    .as_f64()
+                    .map_or("—".into(), |x| format!("{x:.2}x"));
+                writeln!(
+                    out,
+                    "| {} | {} | {:.6} | {:.2}% | {}/{} | {}/{} | {} | {} | {:.4} |",
+                    row["method"].as_str().unwrap(),
+                    row["task"].as_str().unwrap(),
+                    row["mean_test_loss"].as_f64().unwrap(),
+                    row["mean_test_last_token_accuracy"].as_f64().unwrap() * 100.0,
+                    row["matched_development_seeds"],
+                    row["seeds"],
+                    row["final_test_matching_seeds"],
+                    row["seeds"],
+                    seconds,
+                    speedup,
+                    row["median_learning_rate_search_seconds"].as_f64().unwrap()
+                )
+                .unwrap();
+            }
+            writeln!(out, "\n### Wall-clock training and CE at matched exposure\n\nFive fresh paired seeds (7401–7405), identical token-stream digests, tokenizer and warmup/cosine schedule. Peak-rate candidates are shared by AdamW and Interdiffusion. Test curves never select the trial. Training-only time includes forward, derivatives/probes, safeguards and optimizer updates; total wall time also includes data handling and all periodic scoring.\n\n| Method | Task | Paired seeds | Mean final test CE | Median training seconds | Median target tokens/s | Median total wall seconds | CE better than AdamW |\n| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |").unwrap();
+            for row in rows {
+                writeln!(
+                    out,
+                    "| {} | {} | {} | {:.6e} | {:.4} | {:.0} | {:.4} | {}/{} |",
+                    row["method"].as_str().unwrap(),
+                    row["task"].as_str().unwrap(),
+                    row["seeds"],
+                    row["mean_test_loss"].as_f64().unwrap(),
+                    row["median_training_only_seconds"].as_f64().unwrap(),
+                    row["median_training_target_tokens_per_second"]
+                        .as_f64()
+                        .unwrap(),
+                    row["median_selected_training_seconds"].as_f64().unwrap(),
+                    row["test_loss_better_than_adamw_seeds"],
+                    row["seeds"]
+                )
+                .unwrap();
+            }
+            writeln!(out, "\nPer-checkpoint target exposures, paired CE differences and paired bootstrap intervals are retained in `cross_entropy_at_matched_tokens`, `aggregate_quality`, and each worker's complete curves. Tiny deterministic cycle CE can reach numerical underflow; accuracy and nontrivial held-out tasks carry more practical meaning than extremely small CE ratios.").unwrap();
+        }
+    }
+    if let Some(v) = read_json(dir, "sparse_inference") {
+        writeln!(out, "\n## Certified inference: measured speed and fallback\n\nFive paired seeds, five rotated timing batches per seed, 256 forced input tokens per batch at the paper shape (V=2048, d=256, M=512). Index build is timed separately. Trained-bank models share frozen weights across modes; diffuse/separated cases are diagnostic fixtures. CE is scored with the full head; CVP's normalized probability distribution is not approximated.\n\n| Workload | Mode | Pairs | Median tokens/s | Median paired wall speedup | CSR fallback | CVP full scan | Mean CE delta | Greedy agreement | Median index build (ms) |\n| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |").unwrap();
+        for row in v["aggregate"].as_array().unwrap() {
+            let rate = |key: &str| {
+                row[key]
+                    .as_f64()
+                    .map_or("—".into(), |x| format!("{:.2}%", x * 100.0))
+            };
+            writeln!(
+                out,
+                "| {} | {} | {} | {:.0} | {:.3}x | {} | {} | {:.3e} | {:.2}% | {:.3} |",
+                row["workload"].as_str().unwrap(),
+                row["mode"].as_str().unwrap(),
+                row["paired_seeds"],
+                row["median_tokens_per_second"].as_f64().unwrap(),
+                row["median_paired_wall_clock_speedup"].as_f64().unwrap(),
+                rate("mean_memory_fallback_rate"),
+                rate("mean_vocabulary_fallback_rate"),
+                row["mean_cross_entropy_delta"].as_f64().unwrap(),
+                row["mean_greedy_agreement"].as_f64().unwrap() * 100.0,
+                row["median_index_build_seconds"].as_f64().unwrap() * 1000.0
+            )
+            .unwrap();
+        }
+        writeln!(out, "\nThe paper's 2.171x number is a conditional coordinate-work proxy. Use these measured wall-clock rows to assess it. All fallback events are included in throughput. Sparse inference adds index storage; reduced value-mixing work is separate from Interdiffusion's training-memory reduction. Raw batch timings, build-inclusive speed, per-seed fallback counts and repeated-query retrieval timing are in `sparse_inference.json`.\n\nReproduce: `{}`", v["reproduce_command"].as_str().unwrap()).unwrap();
+    }
     if let Some(v) = read_json(dir, "continual_learning") {
         writeln!(
             out,
@@ -800,7 +892,7 @@ fn summary(dir: &Path) -> Result<(), String> {
     fs::write(dir.join("summary.md"), out).map_err(|e| format!("write summary: {e}"))
 }
 
-/// Run one feature or all five and write records to the requested directory.
+/// Run one feature or the complete suite and write records to the requested directory.
 pub fn run(feature: &str, output: Option<&str>) -> Result<(), String> {
     let dir = PathBuf::from(output.unwrap_or(DEFAULT_OUTPUT));
     match feature {
@@ -810,6 +902,30 @@ pub fn run(feature: &str, output: Option<&str>) -> Result<(), String> {
         "refractory" | "refractory_protection" => refractory(&dir)?,
         "ridge" | "ridge_consolidation" => ridge_consolidation(&dir)?,
         "bitnet" | "bitnet_inference" => bitnet_inference(&dir)?,
+        "interdiffusion" => crate::interdiffusion::run_benchmark(&dir)?,
+        "interdiffusion_report" => crate::interdiffusion::benchmark_report(&dir)?,
+        "sparse" | "sparse_inference" => sparse_benchmark::run(&dir)?,
+        "interdiffusion_adamw" => crate::interdiffusion::benchmark_worker(&dir, "adamw")?,
+        "interdiffusion_sgd" => crate::interdiffusion::benchmark_worker(&dir, "sgd")?,
+        "interdiffusion_plain" => crate::interdiffusion::benchmark_worker(&dir, "plain")?,
+        "interdiffusion_spectral_uniform" => {
+            crate::interdiffusion::benchmark_worker(&dir, "spectral_uniform")?
+        }
+        "interdiffusion_interdiffusion" => {
+            crate::interdiffusion::benchmark_worker(&dir, "interdiffusion")?
+        }
+        "interdiffusion_interdiffusion_v1" => {
+            crate::interdiffusion::benchmark_worker(&dir, "interdiffusion_v1")?
+        }
+        "interdiffusion_readout_only" => {
+            crate::interdiffusion::benchmark_worker(&dir, "readout_only")?
+        }
+        "interdiffusion_interdiffusion_probes" => {
+            crate::interdiffusion::benchmark_worker(&dir, "interdiffusion_probes")?
+        }
+        "interdiffusion_interdiffusion_recurrent_only" => {
+            crate::interdiffusion::benchmark_worker(&dir, "interdiffusion_recurrent_only")?
+        }
         "all" => {
             continual(&dir)?;
             episodic_retention(&dir)?;
@@ -817,10 +933,12 @@ pub fn run(feature: &str, output: Option<&str>) -> Result<(), String> {
             refractory(&dir)?;
             ridge_consolidation(&dir)?;
             bitnet_inference(&dir)?;
+            crate::interdiffusion::run_benchmark(&dir)?;
+            sparse_benchmark::run(&dir)?;
         }
         other => {
             return Err(format!(
-                "unknown benchmark feature '{other}' (try continual, retention, geometry, refractory, ridge, or all)"
+                "unknown benchmark feature '{other}' (try continual, retention, geometry, refractory, ridge, bitnet, interdiffusion, sparse, or all)"
             ));
         }
     }

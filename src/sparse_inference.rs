@@ -6,6 +6,7 @@
 //! row deviation.  Both readers fall back to exhaustive evaluation whenever a
 //! requested certificate cannot be proved.
 
+use crate::linalg::dot_slice;
 use crate::memory::HyperbolicEpisodicBankV2;
 use crate::pssa::ParamMatrix;
 
@@ -16,12 +17,15 @@ pub struct SparseReadStats {
     pub omitted_mass_bound: f32,
     pub certified: bool,
     pub exact_fallback: bool,
+    pub center_distance_evaluations: usize,
+    pub value_rows_mixed: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct MemoryCluster {
     center: Vec<f32>,
     radius: f32,
+    center_sq: f32,
     start: usize,
     end: usize,
 }
@@ -34,6 +38,7 @@ pub struct CertifiedMemoryIndex {
     count: usize,
     clusters: Vec<MemoryCluster>,
     order: Vec<usize>,
+    lower_bounds: Vec<f64>,
 }
 
 impl CertifiedMemoryIndex {
@@ -61,16 +66,19 @@ impl CertifiedMemoryIndex {
             clusters.push(MemoryCluster {
                 center,
                 radius,
+                center_sq,
                 start,
                 end,
             });
         }
         let order = (0..clusters.len()).collect();
+        let lower_bounds = vec![0.0; clusters.len()];
         Ok(Self {
             dim_key: bank.dim_key,
             count: bank.count,
             clusters,
             order,
+            lower_bounds,
         })
     }
 
@@ -80,6 +88,15 @@ impl CertifiedMemoryIndex {
 
     pub fn cluster_count(&self) -> usize {
         self.clusters.len()
+    }
+
+    pub fn numeric_storage_bytes(&self) -> usize {
+        self.clusters
+            .iter()
+            .map(|c| c.center.capacity() * 4)
+            .sum::<usize>()
+            + self.order.capacity() * std::mem::size_of::<usize>()
+            + self.lower_bounds.capacity() * 8
     }
 
     /// Read with a certified upper bound on omitted softmax mass.
@@ -122,26 +139,27 @@ impl CertifiedMemoryIndex {
             return Err("certified memory query must be in the open Poincare ball".into());
         }
         out_weights[..bank.count].fill(f32::NAN);
+        for (bound, cluster) in self.lower_bounds.iter_mut().zip(&self.clusters) {
+            let distance = HyperbolicEpisodicBankV2::poincare_distance(
+                q_pnc,
+                q_sq,
+                &cluster.center,
+                cluster.center_sq,
+            ) as f64;
+            let guard = 8.0 * f32::EPSILON as f64 * (distance.abs() + cluster.radius as f64 + 1.0);
+            *bound = (distance - cluster.radius as f64 - guard).max(0.0);
+        }
         self.order.sort_unstable_by(|&a, &b| {
-            let lower = |cluster: &MemoryCluster| {
-                HyperbolicEpisodicBankV2::poincare_distance(
-                    q_pnc,
-                    q_sq,
-                    &cluster.center,
-                    HyperbolicEpisodicBankV2::squared_norm(&cluster.center),
-                )
-                .max(0.0)
-                    - cluster.radius
-            };
-            lower(&self.clusters[a])
-                .max(0.0)
-                .total_cmp(&lower(&self.clusters[b]).max(0.0))
+            self.lower_bounds[a]
+                .total_cmp(&self.lower_bounds[b])
                 .then_with(|| a.cmp(&b))
         });
 
         let mut scanned_clusters = 0usize;
+        let mut scanned_slots = 0usize;
         let mut min_scanned = f32::INFINITY;
         let mut omitted_bound = 1.0f32;
+        let mut scanned_mass = 0.0f64;
         for &cluster_id in &self.order {
             let cluster = &self.clusters[cluster_id];
             for idx in cluster.start..cluster.end {
@@ -153,54 +171,66 @@ impl CertifiedMemoryIndex {
                     bank.norm_sq[idx],
                 );
                 out_weights[idx] = dist;
-                min_scanned = min_scanned.min(dist);
+                if dist < min_scanned {
+                    scanned_mass *= ((dist as f64 - min_scanned as f64) / tau as f64).exp();
+                    min_scanned = dist;
+                }
+                scanned_mass += ((min_scanned as f64 - dist as f64) / tau as f64).exp();
+                scanned_slots += 1;
             }
             scanned_clusters += 1;
 
             // Shift both scanned and unscanned terms by the nearest scanned
             // distance.  This is the same stable softmax as the full reader,
             // with a conservative upper bound for every unscanned cluster.
-            let mut scanned_mass = 0.0f64;
-            for &dist in &out_weights[..bank.count] {
-                if dist.is_finite() {
-                    scanned_mass += ((min_scanned - dist) / tau).exp() as f64;
-                }
-            }
             let mut unscanned_mass = 0.0f64;
             for &other_id in &self.order[scanned_clusters..] {
                 let other = &self.clusters[other_id];
-                let center_dist = HyperbolicEpisodicBankV2::poincare_distance(
-                    q_pnc,
-                    q_sq,
-                    &other.center,
-                    HyperbolicEpisodicBankV2::squared_norm(&other.center),
-                );
-                let lower = (center_dist - other.radius).max(0.0);
-                unscanned_mass +=
-                    (other.end - other.start) as f64 * ((min_scanned - lower) / tau).exp() as f64;
+                unscanned_mass += (other.end - other.start) as f64
+                    * ((min_scanned as f64 - self.lower_bounds[other_id]) / tau as f64).exp();
             }
             omitted_bound = if unscanned_mass == 0.0 {
                 0.0
+            } else if !unscanned_mass.is_finite() {
+                1.0
             } else {
-                (unscanned_mass / (scanned_mass + unscanned_mass)) as f32
+                (unscanned_mass / (scanned_mass + unscanned_mass) + 8.0 * f32::EPSILON as f64)
+                    .min(1.0) as f32
             };
-            if omitted_bound <= epsilon {
+            if epsilon > 0.0 && omitted_bound <= epsilon {
                 break;
             }
         }
 
-        let certified = omitted_bound <= epsilon && scanned_clusters < self.clusters.len();
+        let certified =
+            epsilon > 0.0 && omitted_bound <= epsilon && scanned_clusters < self.clusters.len();
         let exact_fallback = !certified;
         if exact_fallback {
             // Preserve the production reader's accumulation order and bits on
             // fallback.  This is also the safety valve for diffuse banks.
-            bank.retrieve_soft_into(q_pnc, tau, out_val, out_weights);
+            // Distances are already exact. Reuse them with the production
+            // reader's FP32 accumulation order instead of scanning twice.
+            let mut sum = 0.0f32;
+            for w in &mut out_weights[..bank.count] {
+                *w = ((min_scanned - *w) / tau).exp();
+                sum += *w;
+            }
+            out_val.fill(0.0);
+            for idx in 0..bank.count {
+                let weight = out_weights[idx] / sum;
+                out_weights[idx] = weight;
+                for j in 0..bank.dim_val {
+                    out_val[j] += weight * bank.values[idx * bank.dim_val + j];
+                }
+            }
             return Ok(SparseReadStats {
                 scanned_slots: bank.count,
                 populated_slots: bank.count,
                 omitted_mass_bound: 0.0,
                 certified: false,
                 exact_fallback: true,
+                center_distance_evaluations: self.clusters.len(),
+                value_rows_mixed: bank.count,
             });
         }
 
@@ -214,9 +244,14 @@ impl CertifiedMemoryIndex {
             }
         }
         out_val.fill(0.0);
+        let mut value_rows_mixed = 0;
         for idx in 0..bank.count {
             let weight = (out_weights[idx] as f64 / sum) as f32;
             out_weights[idx] = weight;
+            if weight == 0.0 {
+                continue;
+            }
+            value_rows_mixed += 1;
             let off = idx * bank.dim_val;
             for j in 0..bank.dim_val {
                 out_val[j] += weight * bank.values[off + j];
@@ -224,18 +259,13 @@ impl CertifiedMemoryIndex {
         }
         out_weights[bank.count..].fill(0.0);
         Ok(SparseReadStats {
-            scanned_slots: if exact_fallback {
-                bank.count
-            } else {
-                self.clusters[..scanned_clusters]
-                    .iter()
-                    .map(|c| c.end - c.start)
-                    .sum()
-            },
+            scanned_slots,
             populated_slots: bank.count,
             omitted_mass_bound: omitted_bound,
             certified,
             exact_fallback,
+            center_distance_evaluations: self.clusters.len(),
+            value_rows_mixed,
         })
     }
 }
@@ -243,7 +273,9 @@ impl CertifiedMemoryIndex {
 #[derive(Clone, Debug, PartialEq)]
 struct VocabularyCluster {
     centroid: Vec<f32>,
-    radius: f32,
+    radius: f64,
+    max_row_norm: f64,
+    centroid_norm: f64,
     rows: Vec<usize>,
 }
 
@@ -254,6 +286,7 @@ pub struct CertifiedVocabularyIndex {
     vocab: usize,
     clusters: Vec<VocabularyCluster>,
     order: Vec<usize>,
+    upper_bounds: Vec<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -261,6 +294,16 @@ pub struct VocabularySearchStats {
     pub visited_clusters: usize,
     pub exact_rows: usize,
     pub total_rows: usize,
+    pub centroid_rows: usize,
+}
+
+impl VocabularySearchStats {
+    pub fn certified(&self) -> bool {
+        self.exact_rows < self.total_rows
+    }
+    pub fn exact_fallback(&self) -> bool {
+        self.total_rows > 0 && !self.certified()
+    }
 }
 
 impl CertifiedVocabularyIndex {
@@ -268,38 +311,50 @@ impl CertifiedVocabularyIndex {
         if weights.rows == 0 || weights.cols == 0 || cluster_count == 0 {
             return Err("vocabulary index dimensions and cluster count must be positive".into());
         }
+        if weights.data.iter().any(|x| !x.is_finite()) {
+            return Err("vocabulary weights must be finite".into());
+        }
         let clusters_n = cluster_count.min(weights.rows);
         let rows_per_cluster = weights.rows.div_ceil(clusters_n);
         let mut clusters = Vec::new();
         for start in (0..weights.rows).step_by(rows_per_cluster) {
             let end = (start + rows_per_cluster).min(weights.rows);
             let mut centroid = vec![0.0f32; weights.cols];
-            for row in start..end {
-                for (dst, &x) in centroid
-                    .iter_mut()
-                    .zip(&weights.data[row * weights.cols..(row + 1) * weights.cols])
-                {
-                    *dst += x;
-                }
+            for (col, dst) in centroid.iter_mut().enumerate() {
+                *dst = ((start..end)
+                    .map(|row| weights.data[row * weights.cols + col] as f64)
+                    .sum::<f64>()
+                    / (end - start) as f64) as f32;
             }
-            let inv = 1.0 / (end - start) as f32;
-            for x in &mut centroid {
-                *x *= inv;
-            }
-            let mut radius = 0.0f32;
+            let mut radius = 0.0f64;
+            let mut max_row_norm = 0.0f64;
             for row in start..end {
                 let row_data = &weights.data[row * weights.cols..(row + 1) * weights.cols];
                 let distance = row_data
                     .iter()
                     .zip(&centroid)
-                    .map(|(&a, &b)| (a - b) * (a - b))
-                    .sum::<f32>()
+                    .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+                    .sum::<f64>()
                     .sqrt();
-                radius = radius.max(distance);
+                radius = radius.max(distance * (1.0 + 8.0 * f64::EPSILON));
+                max_row_norm = max_row_norm.max(
+                    row_data
+                        .iter()
+                        .map(|&w| (w as f64).powi(2))
+                        .sum::<f64>()
+                        .sqrt(),
+                );
             }
+            let centroid_norm = centroid
+                .iter()
+                .map(|&x| (x as f64).powi(2))
+                .sum::<f64>()
+                .sqrt();
             clusters.push(VocabularyCluster {
                 centroid,
                 radius,
+                max_row_norm,
+                centroid_norm,
                 rows: (start..end).collect(),
             });
         }
@@ -307,12 +362,22 @@ impl CertifiedVocabularyIndex {
             dim: weights.cols,
             vocab: weights.rows,
             order: (0..clusters.len()).collect(),
+            upper_bounds: vec![0.0; clusters.len()],
             clusters,
         })
     }
 
     pub fn cluster_count(&self) -> usize {
         self.clusters.len()
+    }
+
+    pub fn numeric_storage_bytes(&self) -> usize {
+        self.clusters
+            .iter()
+            .map(|c| c.centroid.capacity() * 4 + c.rows.capacity() * std::mem::size_of::<usize>())
+            .sum::<usize>()
+            + self.order.capacity() * std::mem::size_of::<usize>()
+            + self.upper_bounds.capacity() * 8
     }
 
     /// Return the exact greedy token and the amount of row work performed.
@@ -337,21 +402,24 @@ impl CertifiedVocabularyIndex {
         if first_row >= weights.rows {
             return Err("vocabulary search has no valid rows".into());
         }
-        let norm = z.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if z.iter().any(|x| !x.is_finite()) {
+            return Err("vocabulary query must be finite".into());
+        }
+        let norm = z.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
         let scale = 1.0 / (self.dim as f32).sqrt();
+        let u = (self.dim + 8) as f64 * f32::EPSILON as f64;
+        let gamma = u / (1.0 - u).max(f64::MIN_POSITIVE);
+        for (upper, cluster) in self.upper_bounds.iter_mut().zip(&self.clusters) {
+            // Cover FP32 dot/FMA and final scale rounding as well as real-valued
+            // Cauchy-Schwarz. Exact rows use the dense head's SIMD dot kernel.
+            let bound = (dot_slice(&cluster.centroid, z) as f64
+                + (cluster.radius + gamma * (cluster.max_row_norm + cluster.centroid_norm)) * norm)
+                * scale as f64;
+            *upper = bound + 2.0 * f32::EPSILON as f64 * bound.abs();
+        }
         self.order.sort_unstable_by(|&a, &b| {
-            let upper = |cluster: &VocabularyCluster| {
-                (cluster
-                    .centroid
-                    .iter()
-                    .zip(z)
-                    .map(|(&w, &x)| w * x)
-                    .sum::<f32>()
-                    + cluster.radius * norm)
-                    * scale
-            };
-            upper(&self.clusters[b])
-                .total_cmp(&upper(&self.clusters[a]))
+            self.upper_bounds[b]
+                .total_cmp(&self.upper_bounds[a])
                 .then_with(|| a.cmp(&b))
         });
 
@@ -365,12 +433,8 @@ impl CertifiedVocabularyIndex {
                 if row < first_row {
                     continue;
                 }
-                let score = weights.data[row * self.dim..(row + 1) * self.dim]
-                    .iter()
-                    .zip(z)
-                    .map(|(&w, &x)| w * x)
-                    .sum::<f32>()
-                    * scale;
+                let score =
+                    dot_slice(&weights.data[row * self.dim..(row + 1) * self.dim], z) * scale;
                 exact_rows += 1;
                 if score > best || (score == best && row < best_id) {
                     best = score;
@@ -379,16 +443,8 @@ impl CertifiedVocabularyIndex {
             }
             visited_clusters += 1;
             if position + 1 < self.order.len() {
-                let next = &self.clusters[self.order[position + 1]];
-                let upper = (next
-                    .centroid
-                    .iter()
-                    .zip(z)
-                    .map(|(&w, &x)| w * x)
-                    .sum::<f32>()
-                    + next.radius * norm)
-                    * scale;
-                if upper < best {
+                let upper = self.upper_bounds[self.order[position + 1]];
+                if upper < best as f64 {
                     break;
                 }
             }
@@ -399,6 +455,7 @@ impl CertifiedVocabularyIndex {
                 visited_clusters,
                 exact_rows,
                 total_rows: self.vocab.saturating_sub(first_row),
+                centroid_rows: self.clusters.len(),
             },
         ))
     }
@@ -408,6 +465,60 @@ impl CertifiedVocabularyIndex {
 mod tests {
     use super::*;
     use crate::linalg::SimpleRng;
+
+    #[test]
+    fn retrieval_counts_follow_scan_order_and_zero_tolerance_is_bit_exact() {
+        let mut bank = HyperbolicEpisodicBankV2::new(10, 2, 2);
+        for _ in 0..8 {
+            bank.insert(&[0.85, 0.0], &[1.0, -1.0]);
+        }
+        bank.insert(&[0.0, 0.0], &[0.2, 0.3]);
+        let mut index = CertifiedMemoryIndex::build(&bank, 4).unwrap();
+        let mut out = [0.0; 2];
+        let mut weights = [0.0; 10];
+        let stats = index
+            .retrieve_soft_into(&bank, &[0.0, 0.0], 0.05, 0.01, &mut out, &mut weights)
+            .unwrap();
+        assert!(stats.certified);
+        assert_eq!(stats.scanned_slots, 1); // final short cluster visited first
+        assert_eq!(stats.value_rows_mixed, 1);
+        assert_eq!(stats.center_distance_evaluations, 3);
+        let exact = index
+            .retrieve_soft_into(&bank, &[0.0, 0.0], 0.05, 0.0, &mut out, &mut weights)
+            .unwrap();
+        let mut reference = [0.0; 2];
+        let mut reference_weights = [0.0; 10];
+        bank.retrieve_soft_into(&[0.0, 0.0], 0.05, &mut reference, &mut reference_weights);
+        assert!(exact.exact_fallback);
+        assert_eq!(out, reference);
+        assert_eq!(weights, reference_weights);
+    }
+
+    #[test]
+    fn vocabulary_matches_simd_dense_head_across_paired_random_queries_and_ties() {
+        for seed in 1..=5 {
+            let mut rng = SimpleRng::new(seed);
+            let mut weights = ParamMatrix::random_xavier(128, 64, &mut rng);
+            weights.data[64..128].copy_from_slice(&vec![0.25; 64]);
+            weights.data[128..192].copy_from_slice(&vec![0.25; 64]);
+            let mut index = CertifiedVocabularyIndex::build(&weights, 16).unwrap();
+            let mut logits = vec![0.0; 128];
+            for _ in 0..32 {
+                let z: Vec<_> = (0..64).map(|_| rng.gen_range_f32(-1.0, 1.0)).collect();
+                weights.matvec(&z, &mut logits);
+                for logit in &mut logits {
+                    *logit *= 1.0 / 8.0;
+                }
+                let expected = (1..128)
+                    .max_by(|&a, &b| logits[a].total_cmp(&logits[b]).then_with(|| b.cmp(&a)))
+                    .unwrap();
+                let (actual, stats) = index.exact_greedy_from(&weights, &z, 1).unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(stats.centroid_rows, 16);
+                assert_eq!(stats.certified(), !stats.exact_fallback());
+            }
+        }
+    }
 
     #[test]
     fn csr_matches_full_read_and_certifies_separated_clusters() {

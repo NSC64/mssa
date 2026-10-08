@@ -14,9 +14,20 @@ pub struct PlasticAdapterV2 {
 
 impl PlasticAdapterV2 {
     pub fn new(d_latent: usize, rank: usize, rng: &mut SimpleRng) -> Self {
+        Self::new_with_training_state(d_latent, rank, rng, true)
+    }
+
+    pub(crate) fn new_with_training_state(
+        d_latent: usize,
+        rank: usize,
+        rng: &mut SimpleRng,
+        training: bool,
+    ) -> Self {
         Self {
-            down_proj: ParamMatrix::random_xavier(rank, d_latent, rng),
-            up_proj: ParamMatrix::zeros(d_latent, rank),
+            down_proj: ParamMatrix::random_xavier_with_training_state(
+                rank, d_latent, rng, training,
+            ),
+            up_proj: ParamMatrix::zeros_with_training_state(d_latent, rank, training),
             consolidated_up: vec![0.0; d_latent * rank],
             rank,
             d_latent,

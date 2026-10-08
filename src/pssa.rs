@@ -4,7 +4,7 @@ use crate::bitnet::TernaryMatrix;
 use crate::linalg::{SimpleRng, dot_slice, sigmoid, softplus};
 use crate::memory::HyperbolicEpisodicBankV2;
 use crate::sparse_inference::{
-    CertifiedMemoryIndex, CertifiedVocabularyIndex, VocabularySearchStats,
+    CertifiedMemoryIndex, CertifiedVocabularyIndex, SparseReadStats, VocabularySearchStats,
 };
 use std::f32;
 
@@ -22,11 +22,16 @@ pub struct ParamVector {
 
 impl ParamVector {
     pub fn new(len: usize, init_val: f32) -> Self {
+        Self::new_with_training_state(len, init_val, true)
+    }
+
+    fn new_with_training_state(len: usize, init_val: f32, training: bool) -> Self {
+        let state_len = if training { len } else { 0 };
         Self {
             data: vec![init_val; len],
-            grad: vec![0.0; len],
-            m: vec![0.0; len],
-            v: vec![0.0; len],
+            grad: vec![0.0; state_len],
+            m: vec![0.0; state_len],
+            v: vec![0.0; state_len],
         }
     }
 
@@ -76,31 +81,46 @@ pub struct ParamMatrix {
 
 impl ParamMatrix {
     pub fn zeros(rows: usize, cols: usize) -> Self {
+        Self::zeros_with_training_state(rows, cols, true)
+    }
+
+    pub(crate) fn zeros_with_training_state(rows: usize, cols: usize, training: bool) -> Self {
         let total = rows * cols;
+        let state_len = if training { total } else { 0 };
         Self {
             rows,
             cols,
             data: vec![0.0; total],
-            grad: vec![0.0; total],
-            m: vec![0.0; total],
-            v: vec![0.0; total],
+            grad: vec![0.0; state_len],
+            m: vec![0.0; state_len],
+            v: vec![0.0; state_len],
         }
     }
 
     pub fn random_xavier(rows: usize, cols: usize, rng: &mut SimpleRng) -> Self {
+        Self::random_xavier_with_training_state(rows, cols, rng, true)
+    }
+
+    pub(crate) fn random_xavier_with_training_state(
+        rows: usize,
+        cols: usize,
+        rng: &mut SimpleRng,
+        training: bool,
+    ) -> Self {
         let total = rows * cols;
         let limit = (6.0 / (rows + cols) as f32).sqrt();
         let mut data = Vec::with_capacity(total);
         for _ in 0..total {
             data.push(rng.gen_range_f32(-limit, limit));
         }
+        let state_len = if training { total } else { 0 };
         Self {
             rows,
             cols,
             data,
-            grad: vec![0.0; total],
-            m: vec![0.0; total],
-            v: vec![0.0; total],
+            grad: vec![0.0; state_len],
+            m: vec![0.0; state_len],
+            v: vec![0.0; state_len],
         }
     }
 
@@ -361,6 +381,13 @@ pub struct ChunkActivationTape {
 }
 
 impl ChunkActivationTape {
+    /// Metadata only for the private, CPU, one-loop forward-only runtime.
+    fn forward_only(max_l: usize) -> Self {
+        let mut tape = Self::new(0, 0, 0, 0, 0, 0, 0);
+        tape.max_l = max_l;
+        tape
+    }
+
     pub fn new(
         max_l: usize,
         d_vocab: usize,
@@ -500,6 +527,8 @@ pub struct PSSAContinuousBlockV2 {
     /// Runtime-only certified reader. Rebuild after a memory write.
     pub certified_memory_index: Option<CertifiedMemoryIndex>,
     pub certified_memory_epsilon: Option<f32>,
+    /// Runtime telemetry only; excluded from checkpoint serialization.
+    pub last_sparse_read_stats: SparseReadStats,
 
     // 4. Zero-Init Plastic Adapters
     pub adapters: Vec<PlasticAdapterV2>,
@@ -581,6 +610,16 @@ pub struct PSSAContinuousBlockV2 {
     pub inf_mlp_out: Vec<f32>,
     pub inf_z_final: Vec<f32>,
 }
+
+/// One-token observations for opt-in streaming eligibility learning. Standard
+/// inference passes no cache; training/checkpoint shapes are unaffected.
+pub(crate) struct InferenceObservations {
+    pub bar_a: Vec<f32>,
+    pub delta_raw: Vec<f32>,
+    pub adapter_raw: Vec<f32>,
+    pub mlp_raw: Vec<f32>,
+}
+
 impl PSSAContinuousBlockV2 {
     pub(crate) fn new_with_rng(
         cfg: PSSAContinuousConfigV2,
@@ -596,6 +635,18 @@ impl PSSAContinuousBlockV2 {
         d_v: usize,
         loops: usize,
     ) -> Self {
+        Self::new_with_storage(cfg, rng, d_v, loops, true)
+    }
+
+    fn new_with_storage(
+        cfg: PSSAContinuousConfigV2,
+        rng: &mut SimpleRng,
+        d_v: usize,
+        loops: usize,
+        training: bool,
+    ) -> Self {
+        assert!(training || loops == 1);
+        let scratch = |len| vec![0.0; if training { len } else { 0 }];
         let d_m = cfg.d_latent;
         let d_s = cfg.d_state;
         let d_k = cfg.d_mem_key;
@@ -606,11 +657,11 @@ impl PSSAContinuousBlockV2 {
         let state_width = d_m * d_s;
         let rank = 16;
 
-        let norm_gamma = ParamVector::new(d_m, 1.0);
-        let norm_beta = ParamVector::new(d_m, 0.0);
+        let norm_gamma = ParamVector::new_with_training_state(d_m, 1.0, training);
+        let norm_beta = ParamVector::new_with_training_state(d_m, 0.0, training);
 
         // Continuous HiPPO timescale decay initialization
-        let mut a_mat = ParamMatrix::zeros(d_m, d_s);
+        let mut a_mat = ParamMatrix::zeros_with_training_state(d_m, d_s, training);
         let ln_min = 1.5f32.ln();
         let ln_max = 200.0f32.ln();
         for i in 0..d_m {
@@ -627,27 +678,31 @@ impl PSSAContinuousBlockV2 {
             }
         }
 
-        let w_delta = ParamMatrix::random_xavier(d_m, d_m, rng);
-        let w_b = ParamMatrix::random_xavier(d_s, d_m, rng);
-        let w_c = ParamMatrix::random_xavier(d_s, d_m, rng);
+        let w_delta = ParamMatrix::random_xavier_with_training_state(d_m, d_m, rng, training);
+        let w_b = ParamMatrix::random_xavier_with_training_state(d_s, d_m, rng, training);
+        let w_c = ParamMatrix::random_xavier_with_training_state(d_s, d_m, rng, training);
         let h_persistent = vec![0.0; d_m * d_s];
 
-        let w_qx = ParamMatrix::random_xavier(d_k, d_m, rng);
-        let w_qh = ParamMatrix::random_xavier(d_k, d_m, rng);
-        let w_gate = ParamMatrix::random_xavier(d_m, d_m, rng);
-        let w_proj = ParamMatrix::random_xavier(d_m, d_m, rng);
+        let w_qx = ParamMatrix::random_xavier_with_training_state(d_k, d_m, rng, training);
+        let w_qh = ParamMatrix::random_xavier_with_training_state(d_k, d_m, rng, training);
+        let w_gate = ParamMatrix::random_xavier_with_training_state(d_m, d_m, rng, training);
+        let w_proj = ParamMatrix::random_xavier_with_training_state(d_m, d_m, rng, training);
         let memory = HyperbolicEpisodicBankV2::new(mem_cap, d_k, d_m);
 
         let mut adapters = Vec::new();
-        adapters.push(PlasticAdapterV2::new(d_m, rank, rng));
-        let adapter_up_effective = vec![0.0; d_m * rank];
+        adapters.push(PlasticAdapterV2::new_with_training_state(
+            d_m, rank, rng, training,
+        ));
+        let adapter_up_effective = scratch(d_m * rank);
 
-        let mlp_w1 = ParamMatrix::random_xavier(d_mlp, d_m, rng);
-        let mlp_w2 = ParamMatrix::zeros(d_m, d_mlp);
+        let mlp_w1 = ParamMatrix::random_xavier_with_training_state(d_mlp, d_m, rng, training);
+        let mlp_w2 = ParamMatrix::zeros_with_training_state(d_m, d_mlp, training);
 
-        let tape = ChunkActivationTape::new_with_loops(
-            chunk_len, d_v, d_m, d_s, d_k, mem_cap, rank, loops,
-        );
+        let tape = if training {
+            ChunkActivationTape::new_with_loops(chunk_len, d_v, d_m, d_s, d_k, mem_cap, rank, loops)
+        } else {
+            ChunkActivationTape::forward_only(chunk_len)
+        };
         Self {
             cfg,
             norm_gamma,
@@ -659,7 +714,7 @@ impl PSSAContinuousBlockV2 {
             h_persistent,
             ssm_raw_snapshot: vec![f32::NAN; d_m * d_s],
             ssm_rates: vec![0.0; d_m * d_s],
-            ssm_rate_derivatives: vec![0.0; d_m * d_s],
+            ssm_rate_derivatives: scratch(d_m * d_s),
             w_qx,
             w_qh,
             w_gate,
@@ -667,46 +722,47 @@ impl PSSAContinuousBlockV2 {
             memory,
             certified_memory_index: None,
             certified_memory_epsilon: None,
+            last_sparse_read_stats: SparseReadStats::default(),
             adapters,
             adapter_up_effective,
             mlp_w1,
             mlp_w2,
             tape,
-            grad_h_next: vec![0.0; d_m * d_s],
-            grad_z_final: vec![0.0; d_m],
-            grad_z_raw: vec![0.0; d_m],
-            grad_x_norm: vec![0.0; d_m],
-            buf_m_proj: vec![0.0; d_m],
-            buf_ad_out: vec![0.0; d_m],
-            buf_g_mlp_act: vec![0.0; d_mlp],
-            buf_g_mlp_hidden: vec![0.0; d_mlp],
-            buf_g_zraw_mlp: vec![0.0; d_m],
-            buf_g_ad_act: vec![0.0; rank],
-            buf_g_ad_down: vec![0.0; rank],
-            buf_g_m_proj_out: vec![0.0; d_m],
-            buf_g_m_val: vec![0.0; d_m],
-            g_query_pnc: vec![0.0; d_k],
-            g_query_euc: vec![0.0; d_k],
-            g_y_ssm: vec![0.0; d_m],
-            buf_g_delta: vec![0.0; d_m],
-            buf_g_b_proj: vec![0.0; d_s],
-            buf_g_c_proj: vec![0.0; d_s],
-            buf_g_h_prev: vec![0.0; d_m * d_s],
-            bwd_g_zfinal: vec![0.0; chunk_len * d_m],
-            bwd_g_zraw: vec![0.0; chunk_len * d_m],
-            bwd_g_ad_down: vec![0.0; chunk_len * rank],
-            bwd_g_xnorm: vec![0.0; chunk_len * d_m],
-            bwd_g_ysm: vec![0.0; chunk_len * d_m],
-            bwd_g_query_euc: vec![0.0; chunk_len * d_k],
-            bwd_g_query_pnc: vec![0.0; chunk_len * d_k],
-            bwd_g_logits: vec![0.0; chunk_len * d_v],
-            bwd_g_mlp: vec![0.0; chunk_len * d_mlp],
-            ssm_scan_a: vec![0.0; scan_len * state_width],
-            ssm_scan_b: vec![0.0; scan_len * state_width],
-            bwd_ssm_delta: vec![0.0; chunk_len * d_m],
-            bwd_ssm_b: vec![0.0; chunk_len * d_s],
-            bwd_ssm_c: vec![0.0; chunk_len * d_s],
-            bwd_ssm_a: vec![0.0; chunk_len * state_width],
+            grad_h_next: scratch(d_m * d_s),
+            grad_z_final: scratch(d_m),
+            grad_z_raw: scratch(d_m),
+            grad_x_norm: scratch(d_m),
+            buf_m_proj: scratch(d_m),
+            buf_ad_out: scratch(d_m),
+            buf_g_mlp_act: scratch(d_mlp),
+            buf_g_mlp_hidden: scratch(d_mlp),
+            buf_g_zraw_mlp: scratch(d_m),
+            buf_g_ad_act: scratch(rank),
+            buf_g_ad_down: scratch(rank),
+            buf_g_m_proj_out: scratch(d_m),
+            buf_g_m_val: scratch(d_m),
+            g_query_pnc: scratch(d_k),
+            g_query_euc: scratch(d_k),
+            g_y_ssm: scratch(d_m),
+            buf_g_delta: scratch(d_m),
+            buf_g_b_proj: scratch(d_s),
+            buf_g_c_proj: scratch(d_s),
+            buf_g_h_prev: scratch(d_m * d_s),
+            bwd_g_zfinal: scratch(chunk_len * d_m),
+            bwd_g_zraw: scratch(chunk_len * d_m),
+            bwd_g_ad_down: scratch(chunk_len * rank),
+            bwd_g_xnorm: scratch(chunk_len * d_m),
+            bwd_g_ysm: scratch(chunk_len * d_m),
+            bwd_g_query_euc: scratch(chunk_len * d_k),
+            bwd_g_query_pnc: scratch(chunk_len * d_k),
+            bwd_g_logits: scratch(chunk_len * d_v),
+            bwd_g_mlp: scratch(chunk_len * d_mlp),
+            ssm_scan_a: scratch(scan_len * state_width),
+            ssm_scan_b: scratch(scan_len * state_width),
+            bwd_ssm_delta: scratch(chunk_len * d_m),
+            bwd_ssm_b: scratch(chunk_len * d_s),
+            bwd_ssm_c: scratch(chunk_len * d_s),
+            bwd_ssm_a: scratch(chunk_len * state_width),
             inf_x_norm: vec![0.0; d_m],
             inf_delta: vec![0.0; d_m],
             inf_b: vec![0.0; d_s],
@@ -747,7 +803,9 @@ impl PSSAContinuousBlockV2 {
             let raw = self.a_mat.data[i];
             if raw != self.ssm_raw_snapshot[i] {
                 self.ssm_rates[i] = -softplus(raw);
-                self.ssm_rate_derivatives[i] = -sigmoid(raw);
+                if !self.ssm_rate_derivatives.is_empty() {
+                    self.ssm_rate_derivatives[i] = -sigmoid(raw);
+                }
                 self.ssm_raw_snapshot[i] = raw;
             }
         }
@@ -755,8 +813,10 @@ impl PSSAContinuousBlockV2 {
 
     pub fn reset_recurrent_state(&mut self) {
         self.h_persistent.fill(0.0);
-        let start = self.loop_carry_start();
-        self.tape.h_states[start..].fill(0.0);
+        if self.loop_count() > 1 {
+            let start = self.loop_carry_start();
+            self.tape.h_states[start..].fill(0.0);
+        }
     }
 
     /// Each virtual pass has its own causal temporal carry, but shares every
@@ -896,6 +956,26 @@ impl PSSAContinuousBlockV2 {
 
     #[inline(always)]
     pub fn forward_continuous_inference(&mut self, x_features: &[f32], z_out: &mut [f32]) {
+        self.forward_continuous_inference_impl(x_features, z_out, false, None)
+            .expect("unchecked inference has no recoverable errors");
+    }
+
+    pub(crate) fn try_forward_continuous_inference(
+        &mut self,
+        x_features: &[f32],
+        z_out: &mut [f32],
+    ) -> Result<(), String> {
+        self.forward_continuous_inference_impl(x_features, z_out, true, None)
+    }
+
+    #[inline(always)]
+    fn forward_continuous_inference_impl(
+        &mut self,
+        x_features: &[f32],
+        z_out: &mut [f32],
+        checked: bool,
+        mut observations: Option<&mut InferenceObservations>,
+    ) -> Result<(), String> {
         assert_eq!(x_features.len(), self.cfg.d_latent);
         assert_eq!(z_out.len(), self.cfg.d_latent);
         self.refresh_ssm_rates();
@@ -909,6 +989,9 @@ impl PSSAContinuousBlockV2 {
         // 1. Raw continuous input & affine RMSNorm
         let e_t = x_features;
         let sum_sq: f32 = e_t.iter().map(|&x| x * x).sum();
+        if checked && !sum_sq.is_finite() {
+            return Err("non-finite forward-only input norm".into());
+        }
         let inv_rms = 1.0 / (sum_sq / (d_m as f32) + 1e-5).sqrt();
 
         for i in 0..d_m {
@@ -918,6 +1001,9 @@ impl PSSAContinuousBlockV2 {
 
         // 2. Data-Dependent Projections
         self.w_delta.matvec(&self.inf_x_norm, &mut self.inf_delta);
+        if let Some(cache) = observations.as_mut() {
+            cache.delta_raw.copy_from_slice(&self.inf_delta);
+        }
         for i in 0..d_m {
             self.inf_delta[i] = softplus(self.inf_delta[i]);
         }
@@ -934,6 +1020,9 @@ impl PSSAContinuousBlockV2 {
             for j in 0..d_s {
                 let idx = row_off + j;
                 let bar_a = (d_i * self.ssm_rates[idx]).exp();
+                if let Some(cache) = observations.as_mut() {
+                    cache.bar_a[idx] = bar_a;
+                }
                 let bar_b = d_i * self.inf_b[j];
 
                 let h_val = bar_a * self.h_persistent[idx] + bar_b * self.inf_x_norm[i];
@@ -951,6 +1040,9 @@ impl PSSAContinuousBlockV2 {
                 dot_slice(row_x, &self.inf_x_norm) + dot_slice(row_h, &self.inf_y_ssm);
         }
 
+        if checked && self.inf_q_euc.iter().any(|x| !x.is_finite()) {
+            return Err("non-finite forward-only memory query".into());
+        }
         HyperbolicEpisodicBankV2::diffeomorphic_project(&self.inf_q_euc, &mut self.inf_q_pnc);
 
         if let (Some(index), Some(epsilon)) = (
@@ -961,7 +1053,7 @@ impl PSSAContinuousBlockV2 {
             // is the normal read-only inference case. Writes through the model
             // API invalidate the index before reaching this path.
             if index.count() == self.memory.count {
-                index
+                self.last_sparse_read_stats = index
                     .retrieve_soft_into(
                         &self.memory,
                         &self.inf_q_pnc,
@@ -972,6 +1064,13 @@ impl PSSAContinuousBlockV2 {
                     )
                     .expect("validated certified memory index");
             } else {
+                self.last_sparse_read_stats = SparseReadStats {
+                    populated_slots: self.memory.count,
+                    scanned_slots: self.memory.count,
+                    value_rows_mixed: self.memory.count,
+                    exact_fallback: true,
+                    ..Default::default()
+                };
                 self.memory.retrieve_soft_into(
                     &self.inf_q_pnc,
                     self.cfg.tau_mem,
@@ -980,6 +1079,12 @@ impl PSSAContinuousBlockV2 {
                 );
             }
         } else {
+            self.last_sparse_read_stats = SparseReadStats {
+                populated_slots: self.memory.count,
+                scanned_slots: self.memory.count,
+                value_rows_mixed: self.memory.count,
+                ..Default::default()
+            };
             self.memory.retrieve_soft_into(
                 &self.inf_q_pnc,
                 self.cfg.tau_mem,
@@ -999,6 +1104,9 @@ impl PSSAContinuousBlockV2 {
         self.adapters[0]
             .down_proj
             .matvec(&self.inf_x_norm, &mut self.inf_ad_act[..rank]);
+        if let Some(cache) = observations.as_mut() {
+            cache.adapter_raw.copy_from_slice(&self.inf_ad_act);
+        }
         for r in 0..rank {
             let h = self.inf_ad_act[r];
             self.inf_ad_act[r] = h * sigmoid(h);
@@ -1014,6 +1122,9 @@ impl PSSAContinuousBlockV2 {
 
         self.mlp_w1
             .matvec(&self.inf_z_raw, &mut self.inf_mlp_act[..d_mlp]);
+        if let Some(cache) = observations.as_mut() {
+            cache.mlp_raw.copy_from_slice(&self.inf_mlp_act);
+        }
         for i in 0..d_mlp {
             let h = self.inf_mlp_act[i];
             self.inf_mlp_act[i] = h * sigmoid(h);
@@ -1025,7 +1136,11 @@ impl PSSAContinuousBlockV2 {
             self.inf_z_final[i] = self.inf_z_raw[i] + self.inf_mlp_out[i];
         }
 
+        if checked && self.inf_z_final.iter().any(|x| !x.is_finite()) {
+            return Err("non-finite forward-only features".into());
+        }
         z_out.copy_from_slice(&self.inf_z_final);
+        Ok(())
     }
 
     /// Process raw continuous rows, detaching incoming carry at the chunk edge.
@@ -1646,6 +1761,25 @@ impl PSSALayerV2 {
         device: Device,
         loops: usize,
     ) -> Self {
+        Self::new_with_storage(cfg, seed, device, loops, true)
+    }
+
+    /// Private weight-only CPU runtime. Its empty optimizer/tape arrays must
+    /// never be passed to legacy training or checkpoint APIs; the Interdiffusion
+    /// wrapper exposes only the supported forward-only operations.
+    pub(crate) fn new_forward_only(cfg: PSSAConfigV2, seed: u64) -> Self {
+        Self::new_with_storage(cfg, seed, Device::Cpu, 1, false)
+    }
+
+    fn new_with_storage(
+        cfg: PSSAConfigV2,
+        seed: u64,
+        device: Device,
+        loops: usize,
+        training: bool,
+    ) -> Self {
+        assert!(training || (loops == 1 && !device.is_gpu()));
+        let scratch = |len| vec![0.0; if training { len } else { 0 }];
         assert!((1..=Self::MAX_LOOPS).contains(&loops));
         cfg.validate();
         Self::validate_loops_config(&cfg, loops).expect("invalid model allocation");
@@ -1653,16 +1787,20 @@ impl PSSALayerV2 {
         let (v, d, l, depth) = (cfg.d_vocab, cfg.d_latent, cfg.chunk_len, cfg.depth);
         // Preserve main's exact original embedding/block/head random draw order.
         // Extra blocks are initialized only after both shared endpoints.
-        let embed_w = ParamMatrix::random_xavier(v, d, &mut rng);
-        let block = if loops == 1 {
-            PSSAContinuousBlockV2::new_with_rng((&cfg).into(), &mut rng, v)
+        let embed_w = ParamMatrix::random_xavier_with_training_state(v, d, &mut rng, training);
+        let block = if training {
+            if loops == 1 {
+                PSSAContinuousBlockV2::new_with_rng((&cfg).into(), &mut rng, v)
+            } else {
+                PSSAContinuousBlockV2::new_with_rng_and_loops((&cfg).into(), &mut rng, v, loops)
+            }
         } else {
-            PSSAContinuousBlockV2::new_with_rng_and_loops((&cfg).into(), &mut rng, v, loops)
+            PSSAContinuousBlockV2::new_with_storage((&cfg).into(), &mut rng, v, loops, false)
         };
-        let unembed_w = ParamMatrix::random_xavier(v, d, &mut rng);
+        let unembed_w = ParamMatrix::random_xavier_with_training_state(v, d, &mut rng, training);
         let extra_blocks = (1..depth)
             .map(|_| {
-                PSSAContinuousBlockV2::new_with_rng_and_loops((&cfg).into(), &mut rng, 0, loops)
+                PSSAContinuousBlockV2::new_with_storage((&cfg).into(), &mut rng, 0, loops, training)
             })
             .collect();
         Self {
@@ -1677,22 +1815,30 @@ impl PSSALayerV2 {
             lr_schedule_warmup_steps: None,
             embed_w,
             unembed_w,
-            embed_row_marks: vec![0; v],
+            embed_row_marks: vec![0; if training { v } else { 0 }],
             block,
             extra_blocks,
             residual_scales: vec![1.0 / (depth as f32).sqrt(); depth - 1],
-            continuous_inputs: vec![0.0; l * d],
-            output_adjoints: vec![0.0; l * d],
-            input_adjoints: vec![0.0; l * d],
-            residual_block_adjoints: vec![0.0; l * d],
-            residual_input_adjoints: vec![0.0; l * d],
-            boundary_adjoints: (0..=depth).map(|_| vec![0.0; l * d]).collect(),
-            layer_activations: (1..depth).map(|_| vec![0.0; l * d]).collect(),
+            continuous_inputs: scratch(l * d),
+            output_adjoints: scratch(l * d),
+            input_adjoints: scratch(l * d),
+            residual_block_adjoints: scratch(l * d),
+            residual_input_adjoints: scratch(l * d),
+            boundary_adjoints: if training {
+                (0..=depth).map(|_| vec![0.0; l * d]).collect()
+            } else {
+                Vec::new()
+            },
+            layer_activations: if training {
+                (1..depth).map(|_| vec![0.0; l * d]).collect()
+            } else {
+                Vec::new()
+            },
             inf_features: vec![0.0; d],
             inf_block_out: vec![0.0; d],
             certified_vocabulary_index: None,
             bitnet_unembed: None,
-            bitnet_activation_q: vec![0; d],
+            bitnet_activation_q: vec![0; if training { d } else { 0 }],
         }
     }
     pub fn depth(&self) -> usize {
@@ -1921,6 +2067,43 @@ impl PSSALayerV2 {
         for logit in logits_out {
             *logit *= logit_scale;
         }
+    }
+
+    /// Checked CPU/one-loop path for recoverable finite-difference probes.
+    pub(crate) fn try_forward_inference(
+        &mut self,
+        x_id: usize,
+        logits_out: &mut [f32],
+    ) -> Result<(), String> {
+        self.try_forward_inference_observed(x_id, logits_out, None)
+    }
+
+    pub(crate) fn try_forward_inference_observed(
+        &mut self,
+        x_id: usize,
+        logits_out: &mut [f32],
+        observations: Option<&mut InferenceObservations>,
+    ) -> Result<(), String> {
+        assert_eq!(self.loops(), 1);
+        let d = self.cfg.d_latent;
+        self.block.forward_continuous_inference_impl(
+            &self.embed_w.data[x_id * d..(x_id + 1) * d],
+            &mut self.inf_features,
+            true,
+            observations,
+        )?;
+        for (block, &scale) in self.extra_blocks.iter_mut().zip(&self.residual_scales) {
+            block.try_forward_continuous_inference(&self.inf_features, &mut self.inf_block_out)?;
+            for i in 0..d {
+                self.inf_features[i] += scale * self.inf_block_out[i];
+            }
+        }
+        self.unembed_w.matvec(&self.inf_features, logits_out);
+        let scale = 1.0 / (d as f32).sqrt();
+        for value in logits_out {
+            *value *= scale;
+        }
+        Ok(())
     }
 
     /// Quantized-output inference with FP32 recurrent features and stable

@@ -891,6 +891,7 @@ fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
         bwd_ssm_a,
         certified_memory_index: _,
         certified_memory_epsilon: _,
+        last_sparse_read_stats: _, // runtime-only telemetry owns no numeric buffers
     } = b;
     let params: usize = [
         a_mat, w_delta, w_b, w_c, w_qx, w_qh, w_gate, w_proj, mlp_w1, mlp_w2,

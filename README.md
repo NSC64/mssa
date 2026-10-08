@@ -13,8 +13,8 @@ created by [Sparticle62ops](https://github.com/Sparticle62ops). The active fork 
 [Grego1801/mssa](https://github.com/Grego1801/mssa). The selective recurrence,
 episodic memory, plastic adapters, training infrastructure, accelerator
 backends, and terminal interface are derived from the upstream implementation.
-MSSA extends this foundation with experimental certified sparse inference and
-low-bit output-projection research.
+MSSA extends this foundation with experimental certified sparse inference,
+low-bit output-projection research, and forward-only spectral training probes.
 
 MSSA does not use transformer attention or a growing key/value cache. Each
 token updates a fixed-size recurrent carry and can read from a bounded memory
@@ -91,6 +91,21 @@ training rule or checkpoint format. The primary implementation is in
 [`src/pssa.rs`](src/pssa.rs) and generation routing in
 [`src/inference.rs`](src/inference.rs).
 
+The five-paired-seed CPU benchmark now measures wall-clock tokens/s and fallback
+rates at `V=2048`, width `256`, and `512` populated memory slots. On the small
+trained-bank workload, vocabulary-only certification measured `1.442x` paired
+speedup, while the dual path measured `1.351x`. CSR fell back on **90.86%** of
+queries and was slower alone (`0.943x`). The `2.171x` analytical coordinate-work
+proxy is therefore not an observed trained-model speedup. An engineered separated
+fixture measured `2.668x`; a diffuse fixture measured `0.884x`.
+
+```bash
+cargo run --release -- benchmark --feature sparse --out __agent__/sparse_results
+```
+
+See [`docs/MEASURED_RESULTS.md`](docs/MEASURED_RESULTS.md) for paired measurements,
+index-build costs, fidelity, and workload limitations.
+
 ## BitNet research status
 
 MSSA also contains an opt-in BitNet b1.58 experimental implementation in
@@ -110,6 +125,41 @@ The experimental path is not enabled by default. Quantization-aware training
 (QAT), trained-checkpoint evaluation, and optimized integer kernels are further
 research objectives. This implementation was informed by
 [BitNet b1.58](https://arxiv.org/abs/2402.17764).
+
+## Interdiffusion research status
+
+Interdiffusion v2 combines local analytic gradients with streaming forward
+eligibility and rotating cosine-coordinate updates. It avoids reverse-time
+activation tapes; its local gradients, optimizer moments, input tangents, and
+fallback probe buffers are explicitly counted. The original pure zeroth-order
+spectral optimizer remains available as an ablation.
+
+The five-paired-seed audit uses identical tokenizer IDs, token streams, update
+budgets, learning-rate candidates, and warmup/cosine schedules for AdamW and
+Interdiffusion. A confidence-gated readout-curvature update improves mean cycle
+test CE to `3.08e-15`, versus AdamW's `2.48e-5`; both achieve 100% accuracy.
+Mean recall CE is `0.3856` versus `0.3874`. On the tiny held-out byte-text probe,
+Interdiffusion achieves CE `3.0102` versus `3.9252`, improving all five pairs.
+
+The measured trade-off is **quality/storage rather than higher training
+throughput**: cycle training delivers about `39,332` target tokens/s versus
+AdamW's `77,675`. CLI-shape owned numeric storage is `18.86 MiB` versus
+`33.83 MiB` (**44.23% less**), counting curvature, gradients, moments, and traces.
+Strict loss parity remains incomplete: cycle CE improves in three of five pairs,
+and one recall pair misses the 5% final-loss tolerance. The fast eligibility path
+applies to depth-one, empty-bank models; populated/stacked models use spectral
+probes. Interdiffusion remains an opt-in CPU experiment.
+
+Run the reproducible comparison:
+
+```bash
+cargo run --release -- benchmark \
+  --feature interdiffusion \
+  --out __agent__/interdiffusion_results
+```
+
+See [`docs/INTERDIFFUSION.md`](docs/INTERDIFFUSION.md) for the update rule, library
+API, state handling, complete protocol, and measured quality/time trade-offs.
 
 ## Build and run
 
@@ -342,7 +392,13 @@ Checkpoint repair and compatibility tests live in
 | `src/pssa.rs` | MSSA model, recurrence, memory integration, plasticity, and training. |
 | `src/memory.rs` | Hyperbolic episodic memory bank. |
 | `src/sparse_inference.rs` | Certified memory and vocabulary inference indexes. |
+| `src/sparse_benchmark.rs` | Paired wall-clock throughput, certificate fallback, and fidelity measurements. |
 | `src/bitnet.rs` | Experimental packed ternary inference primitives. |
+| `src/interdiffusion.rs` | Weight-only CPU runtime and forward-only spectral optimizer. |
+| `src/interdiffusion_adaptive.rs` | Tape-free hybrid trainer, local readout learning, and probe fallback. |
+| `src/interdiffusion_eligibility.rs` | Streaming recurrent/local derivatives and cosine-coordinate updates. |
+| `src/interdiffusion_input_eligibility.rs` | Bounded embedding-row and normalization tangents. |
+| `src/interdiffusion_benchmark.rs` | Isolated from-scratch learning comparisons. |
 | `src/inference.rs` | Generation and sampling APIs. |
 | `src/feature_benchmark.rs` | Deterministic feature benchmarks. |
 | `src/tui/` | Terminal interface. |
@@ -354,7 +410,9 @@ MSSA is a research prototype. The certified sparse inference path is covered by
 exactness and fallback tests. BitNet post-training quantization currently saves
 memory but does not meet the quality or performance requirements for a default
 path. Larger-scale training, research-specific datasets, and real accelerator
-measurements remain future work.
+measurements remain future work. Interdiffusion v2 improves the measured CPU
+memory/recall-quality trade-off, with strict per-seed parity and broader training
+quality still research objectives.
 
 ## Attribution and community
 

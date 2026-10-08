@@ -2202,7 +2202,12 @@ impl CLIHandler {
             }
             "benchmark" => {
                 println!("Usage: {bin} benchmark [-f|--feature NAME] [-o|--out PATH]");
-                println!("Features: continual, retention, geometry, refractory, ridge, or all.");
+                println!(
+                    "Features: continual, retention, geometry, refractory, ridge, bitnet, interdiffusion, sparse, or all."
+                );
+                println!(
+                    "Interdiffusion compares from-scratch CPU learning in isolated method processes."
+                );
                 println!("Without options, runs the historical verification smoke test.");
                 println!("Feature runs require --feature; --out selects their output directory.");
                 println!(
