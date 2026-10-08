@@ -22,7 +22,6 @@ quality or general-purpose acceleration. The current research areas are:
 
 - certified sparse memory and vocabulary inference;
 - Interdiffusion, an opt-in CPU training experiment;
-- BitNet b1.58 output-head representation experiments;
 - WebGPU and CUDA execution paths inherited from upstream;
 - bounded episodic memory, plastic adapters, and dream replay.
 
@@ -50,6 +49,29 @@ Use the following conventions:
 
 This compatibility layer is deliberate: rebranding user-facing tooling does
 not invalidate the upstream format or silently fork the public Rust API.
+
+## Evidence policy
+
+Performance numbers in this repository are claims about a named workload, not
+about MSSA in general. A reported comparison must name its baseline, model
+shape, backend, hardware, build profile, seeds, exposure, and whether setup or
+fallback work is included. Quality comparisons use held-out data and matched
+target-token exposure; timing comparisons use elapsed wall-clock measurements.
+Coordinate counts, theoretical operation reductions, and memory capacity are
+not substitutes for throughput or resident-memory measurements.
+
+The current headline baselines are:
+
+| Feature | Baseline | Measured result | Scope and limitation |
+| --- | --- | --- | --- |
+| Certified sparse inference | Dense exact reader | Trained-bank GCSR `1.322x`; dual GCSR+CVP `2.411x` | Five paired CPU seeds; held-out CSR is `1.000x` steady state and `0.973x` including index build; diffuse CSR is `0.984x`. |
+| Interdiffusion training | Existing scalar/reference CPU AdamW | `44.23%` less owned numeric storage; slower per scheduled token in the current five-seed audit | Synthetic cycle/recall tasks and a nine-line byte-text diagnostic; not a corpus-scale or accelerator result. |
+| Interdiffusion readout pass | Previous mathematically equivalent implementation | Fused softmax statistics preserved every selected trial's development/test curve in a paired five-seed rerun | One before/after release run; timing is exploratory until repeated on controlled hardware. |
+
+The full protocols, raw-record schema, uncertainty treatment, and limitations
+are in [`docs/MEASURED_RESULTS.md`](docs/MEASURED_RESULTS.md),
+[`docs/INTERDIFFUSION.md`](docs/INTERDIFFUSION.md), and
+[`docs/COMPARISON.md`](docs/COMPARISON.md).
 
 ## Architecture
 
@@ -135,21 +157,31 @@ zeroth-order spectral optimizer remains available as an ablation.
 This is an opt-in CPU experiment. The fast eligibility path is restricted to
 depth-one, empty-bank models; populated or stacked models use spectral-probe
 fallback. The measured trade-off is quality and storage, not higher training
-throughput. See [`docs/INTERDIFFUSION.md`](docs/INTERDIFFUSION.md).
+throughput. The base pass uses one stabilized target/non-target softmax
+partition per token and reuses it for cross entropy, readout error, and
+diagonal curvature; this changes no learning rule. See
+[`docs/INTERDIFFUSION.md`](docs/INTERDIFFUSION.md).
+
+The optimization was checked against the previous implementation on five
+paired seeds (`7401`–`7405`) with the existing release benchmark. Every selected
+development/test curve was semantically identical. One before/after run on an
+Intel Core i7-7500U measured these median training-only times:
+
+| Task | Previous pass | Fused pass | Fused target tokens/s |
+| --- | ---: | ---: | ---: |
+| Cycle | `0.8809 s` | `0.8090 s` | `40,506` |
+| Delayed recall | `0.2340 s` | `0.2190 s` | `75,006` |
+| Byte text | `2.0469 s` | `1.8073 s` | `16,710` |
+
+These timings are a single paired run and are evidence that the change is
+worth measuring further, not a universal Interdiffusion speed claim. The
+reproduction command and exact protocol are documented with the other results.
 
 ```bash
 cargo run --release -- benchmark \
   --feature interdiffusion \
   --out __agent__/interdiffusion_results
 ```
-
-### BitNet representation experiment
-
-The opt-in BitNet b1.58 implementation packs a ternary output-head
-representation and uses symmetric per-token int8 activations. Recurrent carries,
-normalization, memory values, and FP32 master weights remain unchanged. The
-representation-size measurement is not a total process-memory reduction, and
-the current path is not a default-quality or default-performance mode.
 
 ### Dream replay
 
@@ -325,7 +357,6 @@ device.
 | `src/memory.rs` | Hyperbolic episodic memory bank. |
 | `src/sparse_inference.rs` | Certified memory and vocabulary indexes. |
 | `src/interdiffusion*.rs` | Interdiffusion runtime and benchmark components. |
-| `src/bitnet.rs` | Packed ternary output-head experiment. |
 | `src/inference.rs` | Generation and sampling APIs. |
 | `src/tui/` | Terminal-interface subsystems. |
 | `src/feature_benchmark.rs` | Deterministic feature benchmarks. |

@@ -132,6 +132,27 @@ paired speedups to the strict final AdamW development-quality target are 0.35x
 reported. Earlier three-seed constant-rate time-to-quality results do not
 establish a current speed advantage under this stronger protocol.
 
+### Fused readout-statistics check
+
+The Interdiffusion base pass was then compared with its immediately previous
+implementation. The fused pass reuses one stabilized target/non-target softmax
+partition for cross entropy, readout error, and diagonal curvature. Both runs
+used the same release command, five paired seeds (`7401`–`7405`), token-stream
+digests, rate grid, schedule, and test-selection policy on the Intel Core
+i7-7500U host.
+
+| Task | Previous pass median training seconds | Fused pass median training seconds | Fused target tokens/s | Selected curve parity |
+| --- | ---: | ---: | ---: | --- |
+| Cycle | `0.8809` | `0.8090` | `40,506` | identical |
+| Delayed recall | `0.2340` | `0.2190` | `75,006` | identical |
+| Byte text | `2.0469` | `1.8073` | `16,710` | identical |
+
+The comparison is one before/after run and is retained as an implementation
+check, not as a stable speedup claim. Short CPU timings are sensitive to process
+scheduling; repeat the benchmark before using this table as a performance
+headline. The optimization preserves the target `other / sum` curvature form
+instead of using `1 - probability`, avoiding loss of confident-tail precision.
+
 ## 2. Certificate termination and measured inference speed
 
 The inference audit also uses five paired seeds and the paper shape:

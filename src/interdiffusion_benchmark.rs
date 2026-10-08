@@ -574,7 +574,6 @@ impl Learner {
         match self {
             Self::Backprop { model, .. } => {
                 crate::checkpoint::allocation_bytes(&model.cfg).unwrap()
-                    + model.bitnet_activation_q.capacity()
             }
             Self::Forward(trainer) => trainer.numeric_storage_bytes(),
             Self::Adaptive(trainer) => trainer.numeric_storage_bytes(),

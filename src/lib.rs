@@ -1,6 +1,5 @@
 pub mod adapter;
 pub mod backend;
-pub mod bitnet;
 pub mod checkpoint;
 pub mod cli;
 pub mod comparison;

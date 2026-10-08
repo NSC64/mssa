@@ -1,6 +1,5 @@
 use crate::adapter::PlasticAdapterV2;
 use crate::backend::Device;
-use crate::bitnet::TernaryMatrix;
 use crate::linalg::{SimpleRng, dot_slice, sigmoid, softplus};
 use crate::memory::HyperbolicEpisodicBankV2;
 use crate::sparse_inference::{
@@ -1725,9 +1724,6 @@ pub struct PSSALayerV2 {
     pub inf_block_out: Vec<f32>,
     /// Runtime-only exact branch-and-bound output index.
     pub certified_vocabulary_index: Option<CertifiedVocabularyIndex>,
-    /// Runtime-only BitNet-style ternary output head.
-    pub bitnet_unembed: Option<TernaryMatrix>,
-    pub bitnet_activation_q: Vec<i8>,
 }
 
 impl std::ops::Deref for PSSALayerV2 {
@@ -1863,8 +1859,6 @@ impl PSSALayerV2 {
             inf_features: vec![0.0; d],
             inf_block_out: vec![0.0; d],
             certified_vocabulary_index: None,
-            bitnet_unembed: None,
-            bitnet_activation_q: vec![0; if training { d } else { 0 }],
         }
     }
     pub fn depth(&self) -> usize {
@@ -1976,18 +1970,6 @@ impl PSSALayerV2 {
             block.certified_memory_epsilon = None;
         }
         self.certified_vocabulary_index = None;
-    }
-
-    /// Build an inference-only b1.58 output head from the current FP32 rows.
-    /// Training and checkpoint weights remain FP32; optimizer updates
-    /// invalidate this cache and require an explicit rebuild.
-    pub fn enable_bitnet_inference(&mut self) -> Result<(), String> {
-        self.bitnet_unembed = Some(TernaryMatrix::from_param_rowwise(&self.unembed_w)?);
-        Ok(())
-    }
-
-    pub fn disable_bitnet_inference(&mut self) {
-        self.bitnet_unembed = None;
     }
 
     /// Number of detached recurrent carry scalars retained between chunks.
@@ -2128,34 +2110,6 @@ impl PSSALayerV2 {
         let scale = 1.0 / (d as f32).sqrt();
         for value in logits_out {
             *value *= scale;
-        }
-        Ok(())
-    }
-
-    /// Quantized-output inference with FP32 recurrent features and stable
-    /// normalization. The output projection is the first MSSA BitNet target;
-    /// quantizing the recurrent carry itself is intentionally a separate study.
-    pub fn forward_inference_bitnet(
-        &mut self,
-        x_id: usize,
-        logits_out: &mut [f32],
-    ) -> Result<(), String> {
-        if logits_out.len() != self.cfg.d_vocab {
-            return Err("BitNet logits buffer has the wrong size".into());
-        }
-        self.forward_inference_features(x_id);
-        let quantized = self
-            .bitnet_unembed
-            .as_ref()
-            .ok_or("BitNet inference head is not enabled")?;
-        quantized.matvec_int8(
-            &self.inf_features,
-            &mut self.bitnet_activation_q,
-            logits_out,
-        )?;
-        let scale = 1.0 / (self.cfg.d_latent as f32).sqrt();
-        for logit in logits_out {
-            *logit *= scale;
         }
         Ok(())
     }
@@ -2715,7 +2669,6 @@ impl PSSALayerV2 {
             self.step_counter = step.expect("optimizer step counter overflow");
             ctx.invalidate_weights();
             self.certified_vocabulary_index = None;
-            self.bitnet_unembed = None;
             return GradientClipOutcome::Applied { norm };
         }
         let mut tensors = self.adam_tensors();
@@ -2746,7 +2699,6 @@ impl PSSALayerV2 {
             ctx.invalidate_weights();
         }
         self.certified_vocabulary_index = None;
-        self.bitnet_unembed = None;
         GradientClipOutcome::Applied { norm }
     }
 
@@ -2772,7 +2724,6 @@ impl PSSALayerV2 {
         // The output rows changed; a CVP radius/centroid index is no longer
         // valid until the caller explicitly rebuilds it.
         self.certified_vocabulary_index = None;
-        self.bitnet_unembed = None;
     }
     pub fn backward_and_step_chunk(&mut self, seq_len: usize) {
         self.zero_gradients();

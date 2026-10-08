@@ -95,6 +95,33 @@ updates are bounded by `chunk_len`; longer training documents can use successive
 chunks with `reset = false` after the first chunk. Incoming carry is detached at
 each update. New optimizer state is not exposed through legacy checkpoint APIs.
 
+## Fused readout statistics
+
+The v2 base pass now computes the stabilized softmax partition once per token:
+the maximum logit, the target exponential, the sum of non-target exponentials,
+and the total normalization. It reuses those values for stable cross entropy,
+the readout error, and diagonal CE curvature instead of recomputing the same
+exponentials in each consumer. The target curvature deliberately retains the
+`other / sum` form rather than `1 - probability`, preserving representable
+confident-tail values.
+
+This is an algebraic implementation optimization, not a new optimizer or a
+changed objective. A before/after release run on an Intel Core i7-7500U with
+five paired seeds (`7401`–`7405`) produced identical selected development/test
+curves for all 15 Interdiffusion task/seed trials. The single-run median
+training-only times were:
+
+| Task | Previous pass | Fused pass | Fused target tokens/s |
+| --- | ---: | ---: | ---: |
+| Cycle | `0.8809 s` | `0.8090 s` | `40,506` |
+| Delayed recall | `0.2340 s` | `0.2190 s` | `75,006` |
+| Byte text | `2.0469 s` | `1.8073 s` | `16,710` |
+
+These are paired engineering measurements, not a repeated performance study;
+OS scheduling and release-process startup can move short timings. The normal
+feature benchmark remains the source of quality, storage, and method-vs-AdamW
+claims.
+
 ## V2 learning rule
 
 - **Readout, C projection, adapters, and MLP:** exact current-token local
