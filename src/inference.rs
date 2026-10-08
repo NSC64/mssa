@@ -261,6 +261,7 @@ impl<'a> PSSAInferenceEngine<'a> {
     /// once per generated token, not for prefill or the final BPE text flush.
     /// Weights belong to the input that predicted the selected token; with loops
     /// enabled, scratch buffers hold the final pass of each layer.
+    #[cfg(test)]
     pub(crate) fn try_generate_chat_turn_observed<F, C, O>(
         &mut self,
         prompt: &str,
@@ -339,9 +340,8 @@ impl<'a> PSSAInferenceEngine<'a> {
             && cfg.repetition_penalty == 1.0
             && !scored
             && self.model.certified_vocabulary_index.is_some();
-        let bitnet_quantized = cfg.bitnet_quantized
-            && !certified_greedy
-            && self.model.bitnet_unembed.is_some();
+        let bitnet_quantized =
+            cfg.bitnet_quantized && !certified_greedy && self.model.bitnet_unembed.is_some();
         let mut logits = vec![0.0f32; d_v];
         let mut probs = vec![0.0f32; d_v];
         let mut candidates: Vec<(usize, f32)> = Vec::with_capacity(d_v);
@@ -683,9 +683,7 @@ mod tests {
         let tokenizer = word_tokenizer("word");
         let mut dense = tiny_model(&tokenizer);
         let mut certified = tiny_model(&tokenizer);
-        certified
-            .enable_certified_inference(0.01, 1, 2)
-            .unwrap();
+        certified.enable_certified_inference(0.01, 1, 2).unwrap();
         let cfg = InferenceConfig {
             temperature: 0.0,
             repetition_penalty: 1.0,

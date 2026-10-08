@@ -1,5 +1,5 @@
-//! Isolated-process, from-scratch CPU experiments. Each method gets the same
-//! seeds/documents and two learning-rate trials, with separate development and
+//! Isolated-process, from-scratch CPU experiments. Methods share seeds/documents
+//! and use method-specific learning-rate grids, with separate development and
 //! longer-sequence test sets. This is a synthetic learning probe, not an LLM
 //! pretraining or general-knowledge result.
 

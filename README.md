@@ -167,7 +167,7 @@ API, state handling, complete protocol, and measured quality/time trade-offs.
 
 ### Requirements
 
-- Rust 1.85 or newer with Edition 2024 support.
+- Rust 1.88 or newer (Edition 2024 and let-chain support).
 - Cargo.
 - Network access only for HTTP or Hugging Face dataset sources.
 - For CUDA execution: a build with `--features cuda`, a compatible NVIDIA
@@ -420,6 +420,23 @@ Accelerator measurements require execution on the corresponding device.
 
 ## Development
 
+For repeated local edits, use the optimized incremental `fast` profile:
+
+```bash
+cargo check --profile fast --tests
+cargo build --profile fast
+cargo test --profile fast
+cargo run --profile fast -- help
+# Optional NVIDIA CUDA backend:
+cargo build --profile fast --features cuda
+```
+
+This profile enables incremental compilation, disables LTO, and uses 16 codegen
+units while retaining optimization level 3. Its binaries and compiler cache live
+under `target/fast/`. The first build populates the cache; subsequent edits can
+reuse it. Debug builds (`cargo build`) already enable incremental compilation.
+Keep using the normal release profile for reproducible performance measurements.
+
 Run the release tests:
 
 ```bash
@@ -473,12 +490,12 @@ Checkpoint repair and compatibility tests live in
 ## Project status
 
 MSSA is a research prototype. The certified sparse inference path is covered by
-exactness and fallback tests. BitNet post-training quantization currently saves
-memory but does not meet the quality or performance requirements for a default
-path. Larger-scale training, research-specific datasets, and real accelerator
-measurements remain future work. Interdiffusion v2 improves the measured CPU
-memory/recall-quality trade-off, with strict per-seed parity and broader training
-quality still research objectives.
+exactness and fallback tests. BitNet post-training quantization compresses the
+output-head representation while retaining FP32 master weights; it does not meet
+the quality or performance requirements for a default path. Larger-scale training,
+research-specific datasets, and real accelerator measurements remain future work.
+Interdiffusion v2 improves the measured CPU memory/recall-quality trade-off, with
+strict per-seed parity and broader training quality still research objectives.
 
 Upstream's WebGPU recurrent and memory training stages are integrated, including
 packed document lanes. Small CPU/WebGPU forward and gradient parity tests and
