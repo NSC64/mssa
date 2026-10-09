@@ -49,6 +49,122 @@ pub struct ForwardModel {
     saved_state: Vec<f32>,
 }
 
+fn copy_data(dst: &mut [f32], src: &[f32], label: &str) -> Result<(), String> {
+    if dst.len() != src.len() {
+        return Err(format!(
+            "Interdiffusion checkpoint shape mismatch for {label}"
+        ));
+    }
+    dst.copy_from_slice(src);
+    Ok(())
+}
+
+fn copy_matrix_data(dst: &mut ParamMatrix, src: &ParamMatrix, label: &str) -> Result<(), String> {
+    if dst.rows != src.rows || dst.cols != src.cols {
+        return Err(format!(
+            "Interdiffusion checkpoint shape mismatch for {label}"
+        ));
+    }
+    copy_data(&mut dst.data, &src.data, label)
+}
+
+fn copy_vector_data(dst: &mut ParamVector, src: &ParamVector, label: &str) -> Result<(), String> {
+    copy_data(&mut dst.data, &src.data, label)
+}
+
+fn copy_block_state(
+    dst: &mut crate::pssa::PSSAContinuousBlockV2,
+    src: &crate::pssa::PSSAContinuousBlockV2,
+) -> Result<(), String> {
+    copy_vector_data(&mut dst.norm_gamma, &src.norm_gamma, "norm_gamma")?;
+    copy_vector_data(&mut dst.norm_beta, &src.norm_beta, "norm_beta")?;
+    copy_matrix_data(&mut dst.a_mat, &src.a_mat, "a_mat")?;
+    copy_matrix_data(&mut dst.w_delta, &src.w_delta, "w_delta")?;
+    copy_matrix_data(&mut dst.w_b, &src.w_b, "w_b")?;
+    copy_matrix_data(&mut dst.w_c, &src.w_c, "w_c")?;
+    copy_matrix_data(&mut dst.w_qx, &src.w_qx, "w_qx")?;
+    copy_matrix_data(&mut dst.w_qh, &src.w_qh, "w_qh")?;
+    copy_matrix_data(&mut dst.w_gate, &src.w_gate, "w_gate")?;
+    copy_matrix_data(&mut dst.w_proj, &src.w_proj, "w_proj")?;
+    copy_matrix_data(&mut dst.mlp_w1, &src.mlp_w1, "mlp_w1")?;
+    copy_matrix_data(&mut dst.mlp_w2, &src.mlp_w2, "mlp_w2")?;
+    if dst.adapters.len() != src.adapters.len() {
+        return Err("Interdiffusion checkpoint adapter count mismatch".into());
+    }
+    for (dst_adapter, src_adapter) in dst.adapters.iter_mut().zip(&src.adapters) {
+        copy_matrix_data(
+            &mut dst_adapter.down_proj,
+            &src_adapter.down_proj,
+            "adapter_down",
+        )?;
+        copy_matrix_data(&mut dst_adapter.up_proj, &src_adapter.up_proj, "adapter_up")?;
+        copy_data(
+            &mut dst_adapter.consolidated_up,
+            &src_adapter.consolidated_up,
+            "adapter_consolidated_up",
+        )?;
+    }
+    copy_data(&mut dst.h_persistent, &src.h_persistent, "recurrent_carry")?;
+    if dst.memory.capacity != src.memory.capacity
+        || dst.memory.dim_key != src.memory.dim_key
+        || dst.memory.dim_val != src.memory.dim_val
+    {
+        return Err("Interdiffusion checkpoint memory shape mismatch".into());
+    }
+    dst.memory.count = src.memory.count;
+    dst.memory.write_head = src.memory.write_head;
+    dst.memory.value_cap = src.memory.value_cap;
+    copy_data(&mut dst.memory.keys, &src.memory.keys, "memory_keys")?;
+    copy_data(&mut dst.memory.values, &src.memory.values, "memory_values")?;
+    copy_data(
+        &mut dst.memory.norm_sq,
+        &src.memory.norm_sq,
+        "memory_norm_sq",
+    )?;
+    copy_data(
+        &mut dst.memory.confidence,
+        &src.memory.confidence,
+        "memory_confidence",
+    )?;
+    if dst.memory.last_seen_step.len() != src.memory.last_seen_step.len() {
+        return Err("Interdiffusion checkpoint memory metadata mismatch".into());
+    }
+    dst.memory
+        .last_seen_step
+        .copy_from_slice(&src.memory.last_seen_step);
+    Ok(())
+}
+
+fn copy_model_state(dst: &mut PSSALayerV2, src: &PSSALayerV2) -> Result<(), String> {
+    if dst.cfg.d_vocab != src.cfg.d_vocab
+        || dst.cfg.d_latent != src.cfg.d_latent
+        || dst.cfg.d_state != src.cfg.d_state
+        || dst.cfg.d_mem_key != src.cfg.d_mem_key
+        || dst.cfg.mem_capacity != src.cfg.mem_capacity
+        || dst.cfg.chunk_len != src.cfg.chunk_len
+        || dst.depth() != src.depth()
+        || dst.loops() != src.loops()
+    {
+        return Err("Interdiffusion checkpoint model shape mismatch".into());
+    }
+    copy_matrix_data(&mut dst.embed_w, &src.embed_w, "embedding")?;
+    copy_matrix_data(&mut dst.unembed_w, &src.unembed_w, "unembedding")?;
+    copy_block_state(&mut dst.block, &src.block)?;
+    for (dst_block, src_block) in dst.extra_blocks.iter_mut().zip(&src.extra_blocks) {
+        copy_block_state(dst_block, src_block)?;
+    }
+    dst.step_counter = src.step_counter;
+    dst.rng.state = src.rng.state;
+    dst.vocabulary = src.vocabulary.clone();
+    dst.tokenizer_json = src.tokenizer_json.clone();
+    dst.lr_schedule_total_updates = src.lr_schedule_total_updates;
+    dst.lr_schedule_warmup_steps = src.lr_schedule_warmup_steps;
+    let mut carry = vec![0.0; src.recurrent_state_len()];
+    src.copy_recurrent_state_to(&mut carry);
+    dst.copy_recurrent_state_from(&carry);
+    Ok(())
+}
+
 impl ForwardModel {
     pub fn new(cfg: PSSAConfigV2, seed: u64) -> Result<Self, String> {
         crate::checkpoint::validate_model_config(&cfg)?;
@@ -190,6 +306,11 @@ impl ForwardModel {
             words += block.memory.last_seen_step.capacity();
         }
         floats * std::mem::size_of::<f32>() + words * std::mem::size_of::<usize>()
+    }
+
+    fn set_metadata(&mut self, vocabulary: Vec<String>, tokenizer_json: Option<String>) {
+        self.model.vocabulary = vocabulary;
+        self.model.tokenizer_json = tokenizer_json;
     }
 }
 

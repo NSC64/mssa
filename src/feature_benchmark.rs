@@ -751,7 +751,7 @@ fn summary(dir: &Path) -> Result<(), String> {
         }
     }
     if let Some(v) = read_json(dir, "sparse_inference") {
-        writeln!(out, "\n## Certified inference: measured speed and fallback\n\nFive paired seeds, five rotated timing batches per seed, 256 forced input tokens per batch at the paper shape (V=2048, d=256, M=512). Index build is timed separately. Trained-bank models share frozen weights across modes; diffuse/separated cases are diagnostic fixtures. CE is scored with the full head; CVP's normalized probability distribution is not approximated.\n\n| Workload | Mode | Pairs | Median tokens/s | Median paired wall speedup | CSR fallback | CVP full scan | Mean CE delta | Greedy agreement | Median index build (ms) |\n| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |").unwrap();
+        writeln!(out, "\n## Certified inference: measured speed and fallback\n\nFive paired seeds, five rotated timing batches per seed, 256 forced input tokens per batch at the paper shape (V=2048, d=256, M=512). Index build is timed separately. Trained-bank models share frozen weights across modes; diffuse/separated cases are diagnostic fixtures. CE is scored with the full head; CVP's normalized probability distribution is not approximated.\n\n| Workload | Mode | Pairs | Median tokens/s | Median paired wall speedup | CSR fallback | CVP full scan | CVP bypass reads | Mean CE delta | Greedy agreement | Median index build (ms) |\n| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |").unwrap();
         for row in v["aggregate"].as_array().unwrap() {
             let rate = |key: &str| {
                 row[key]
@@ -760,7 +760,7 @@ fn summary(dir: &Path) -> Result<(), String> {
             };
             writeln!(
                 out,
-                "| {} | {} | {} | {:.0} | {:.3}x | {} | {} | {:.3e} | {:.2}% | {:.3} |",
+                "| {} | {} | {} | {:.0} | {:.3}x | {} | {} | {:.1} | {:.3e} | {:.2}% | {:.3} |",
                 row["workload"].as_str().unwrap(),
                 row["mode"].as_str().unwrap(),
                 row["paired_seeds"],
@@ -768,6 +768,9 @@ fn summary(dir: &Path) -> Result<(), String> {
                 row["median_paired_wall_clock_speedup"].as_f64().unwrap(),
                 rate("mean_memory_fallback_rate"),
                 rate("mean_vocabulary_fallback_rate"),
+                row["mean_vocabulary_routing_bypassed_reads"]
+                    .as_f64()
+                    .unwrap(),
                 row["mean_cross_entropy_delta"].as_f64().unwrap(),
                 row["mean_greedy_agreement"].as_f64().unwrap() * 100.0,
                 row["median_index_build_seconds"].as_f64().unwrap() * 1000.0

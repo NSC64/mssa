@@ -202,6 +202,7 @@ pub(super) fn run(dir: &Path) -> Result<(), String> {
                 let (mut slots, mut centers, mut mixes, mut exact_rows, mut centroids) =
                     (0, 0, 0, 0, 0);
                 let (mut bounds, mut bypasses, mut budget_fallbacks) = (0, 0, 0);
+                let mut vocab_bypasses = 0;
                 let mut max_omitted_mass = 0.0f64;
                 let mut max_mass_bound = 0.0f32;
                 let mut reference_val = vec![0.0; model.cfg.d_latent];
@@ -251,6 +252,7 @@ pub(super) fn run(dir: &Path) -> Result<(), String> {
                         let (id, stats) = model.certified_greedy_current()?;
                         vocab_cert += usize::from(stats.certified());
                         vocab_fallback += usize::from(stats.exact_fallback());
+                        vocab_bypasses += usize::from(stats.routing_bypassed);
                         exact_rows += stats.exact_rows;
                         centroids += stats.centroid_rows;
                         // CVP fidelity is checked against the identical CSR/dense features.
@@ -319,6 +321,7 @@ pub(super) fn run(dir: &Path) -> Result<(), String> {
                     "max_actual_omitted_mass": max_omitted_mass, "max_omitted_mass_bound": max_mass_bound,
                     "memory_fallback_rate": if *mode == "csr" || *mode == "dual" {Some(mem_fallback as f64 / TOKENS as f64)} else {None},
                     "vocabulary_certified_tokens": vocab_cert, "vocabulary_full_scan_tokens": vocab_fallback,
+                    "vocabulary_routing_bypassed_reads": vocab_bypasses,
                     "vocabulary_fallback_rate": if *mode == "cvp" || *mode == "dual" {Some(vocab_fallback as f64 / TOKENS as f64)} else {None},
                     "mean_scanned_slots": slots as f64 / TOKENS as f64, "mean_exact_vocabulary_rows": exact_rows as f64 / TOKENS as f64,
                     "mean_value_rows_mixed": mixes as f64 / TOKENS as f64,
@@ -358,6 +361,7 @@ pub(super) fn run(dir: &Path) -> Result<(), String> {
                 "min_paired_wall_clock_speedup": values("paired_wall_clock_speedup").into_iter().fold(f64::INFINITY, f64::min),
                 "max_paired_wall_clock_speedup": values("paired_wall_clock_speedup").into_iter().fold(0.0, f64::max),
                 "mean_memory_fallback_rate": mean("memory_fallback_rate"), "mean_vocabulary_fallback_rate": mean("vocabulary_fallback_rate"),
+                "mean_vocabulary_routing_bypassed_reads": mean("vocabulary_routing_bypassed_reads"),
                 "mean_scanned_slots": mean("mean_scanned_slots"),
                 "mean_value_rows_mixed": mean("mean_value_rows_mixed"),
                 "mean_memory_routing_bypassed_reads": mean("memory_routing_bypassed_reads"),

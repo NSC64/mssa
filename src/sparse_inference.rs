@@ -391,6 +391,8 @@ pub struct CertifiedVocabularyIndex {
     clusters: Vec<VocabularyCluster>,
     order: Vec<usize>,
     upper_bounds: Vec<f64>,
+    unprofitable_reads: usize,
+    dense_reads_remaining: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -399,6 +401,7 @@ pub struct VocabularySearchStats {
     pub exact_rows: usize,
     pub total_rows: usize,
     pub centroid_rows: usize,
+    pub routing_bypassed: bool,
 }
 
 impl VocabularySearchStats {
@@ -468,6 +471,8 @@ impl CertifiedVocabularyIndex {
             order: (0..clusters.len()).collect(),
             upper_bounds: vec![0.0; clusters.len()],
             clusters,
+            unprofitable_reads: 0,
+            dense_reads_remaining: 0,
         })
     }
 
@@ -508,6 +513,20 @@ impl CertifiedVocabularyIndex {
         }
         if z.iter().any(|x| !x.is_finite()) {
             return Err("vocabulary query must be finite".into());
+        }
+        let total_rows = self.vocab.saturating_sub(first_row);
+        if self.dense_reads_remaining > 0 {
+            self.dense_reads_remaining -= 1;
+            return Ok((
+                Self::dense_greedy(weights, z, first_row),
+                VocabularySearchStats {
+                    exact_rows: total_rows,
+                    total_rows,
+                    centroid_rows: self.clusters.len(),
+                    routing_bypassed: true,
+                    ..Default::default()
+                },
+            ));
         }
         let norm = z.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
         let scale = 1.0 / (self.dim as f32).sqrt();
@@ -553,15 +572,42 @@ impl CertifiedVocabularyIndex {
                 }
             }
         }
-        Ok((
-            best_id,
-            VocabularySearchStats {
-                visited_clusters,
-                exact_rows,
-                total_rows: self.vocab.saturating_sub(first_row),
-                centroid_rows: self.clusters.len(),
-            },
-        ))
+        let stats = VocabularySearchStats {
+            visited_clusters,
+            exact_rows,
+            total_rows,
+            centroid_rows: self.clusters.len(),
+            routing_bypassed: false,
+        };
+        if stats.exact_fallback() {
+            self.unprofitable_reads += 1;
+            if self.unprofitable_reads >= 3 {
+                // ponytail: fixed bounded backoff; calibrate by query shape only
+                // if a measured deployment needs finer routing policy.
+                self.dense_reads_remaining = 31;
+                self.unprofitable_reads = 0;
+            }
+        } else {
+            self.unprofitable_reads = 0;
+        }
+        Ok((best_id, stats))
+    }
+
+    fn dense_greedy(weights: &ParamMatrix, z: &[f32], first_row: usize) -> usize {
+        let scale = 1.0 / (weights.cols as f32).sqrt();
+        let mut best_id = first_row;
+        let mut best = f32::NEG_INFINITY;
+        for row in first_row..weights.rows {
+            let score = dot_slice(
+                &weights.data[row * weights.cols..(row + 1) * weights.cols],
+                z,
+            ) * scale;
+            if score > best || (score == best && row < best_id) {
+                best = score;
+                best_id = row;
+            }
+        }
+        best_id
     }
 }
 
@@ -623,6 +669,25 @@ mod tests {
                 assert_eq!(stats.certified(), !stats.exact_fallback());
             }
         }
+    }
+
+    #[test]
+    fn vocabulary_backoff_is_exact_after_repeated_full_scans() {
+        let mut weights = ParamMatrix::zeros(64, 8);
+        for (row, value) in weights.data.chunks_exact_mut(8).enumerate() {
+            value[0] = row as f32 / 64.0;
+        }
+        let mut index = CertifiedVocabularyIndex::build(&weights, 8).unwrap();
+        let query = [0.0; 8];
+        for _ in 0..3 {
+            let (_, stats) = index.exact_greedy_from(&weights, &query, 1).unwrap();
+            assert!(stats.exact_fallback());
+            assert!(!stats.routing_bypassed);
+        }
+        let (actual, stats) = index.exact_greedy_from(&weights, &query, 1).unwrap();
+        assert_eq!(actual, 1);
+        assert!(stats.routing_bypassed);
+        assert!(stats.exact_fallback());
     }
 
     #[test]

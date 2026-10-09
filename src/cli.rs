@@ -25,6 +25,22 @@ const MAX_GENERATION_TOKENS: usize = 100_000;
 /// Opt-in clipping tolerates isolated bad gradients, not sustained divergence.
 const MAX_CONSECUTIVE_SKIPPED_UPDATES: usize = 20;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainingOptimizer {
+    AdamW,
+    Interdiffusion,
+}
+
+impl TrainingOptimizer {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "adamw" => Ok(Self::AdamW),
+            "interdiffusion" => Ok(Self::Interdiffusion),
+            _ => Err("--optimizer must be adamw or interdiffusion".into()),
+        }
+    }
+}
+
 #[derive(Default)]
 struct SkippedUpdates {
     total: usize,
@@ -51,6 +67,7 @@ impl SkippedUpdates {
 
 #[derive(Clone, Debug)]
 pub struct TrainingOptions {
+    pub optimizer: TrainingOptimizer,
     /// Runtime-only selection; automatic GPU/CPU fallback remains the default.
     pub backend: TrainingBackend,
     pub epochs: usize,
@@ -117,6 +134,7 @@ pub struct TrainingOptions {
 impl Default for TrainingOptions {
     fn default() -> Self {
         Self {
+            optimizer: TrainingOptimizer::AdamW,
             backend: TrainingBackend::Auto,
             epochs: 4,
             latent: 256,
@@ -391,6 +409,9 @@ impl CLIHandler {
             x => return Err(format!("--tokenizer must be bpe or word, got '{x}'")),
         };
         let x = TrainingOptions {
+            optimizer: TrainingOptimizer::parse(
+                parsed.string("--optimizer", "").unwrap_or("adamw"),
+            )?,
             backend: TrainingBackend::parse(parsed.string("--backend", "").unwrap_or("auto"))?,
             epochs: parsed.usize_nonzero("--epochs", "-e", 4)?,
             latent: parsed.usize_nonzero("--latent", "", 256)?,
@@ -673,6 +694,9 @@ impl CLIHandler {
         options: &TrainingOptions,
     ) -> Result<(PSSALayerV2, Tokenizer), String> {
         let _plain_output = ui::plain_output(options.no_tui);
+        if options.optimizer == TrainingOptimizer::Interdiffusion {
+            return Self::train_corpus_interdiffusion(raw, options);
+        }
         if options.epochs == 0
             || options.latent == 0
             || options.state == 0
@@ -1295,6 +1319,190 @@ impl CLIHandler {
         Ok((model, tokenizer))
     }
 
+    fn train_corpus_interdiffusion(
+        raw: &str,
+        options: &TrainingOptions,
+    ) -> Result<(PSSALayerV2, Tokenizer), String> {
+        if options.resume.is_some() && options.batch_size != 1 {
+            return Err("Interdiffusion resume requires --batch-size 1".into());
+        }
+        if options.backend != TrainingBackend::Auto && options.backend != TrainingBackend::Cpu {
+            return Err("Interdiffusion is CPU-only; use --backend cpu or omit --backend".into());
+        }
+        if options.loops != 1 {
+            return Err("Interdiffusion currently supports --loops 1".into());
+        }
+        if options.batch_size != 1 || options.accumulate != 1 {
+            return Err(
+                "Interdiffusion currently requires --batch-size 1 and --accumulate 1; use AdamW for packed or accumulated training".into(),
+            );
+        }
+        if options.dream_every > 0 {
+            return Err("Interdiffusion does not support --dream-every yet".into());
+        }
+        if options.loss_csv.is_some() {
+            return Err("Interdiffusion does not support --loss-csv yet".into());
+        }
+        if options.epochs == 0
+            || options.latent == 0
+            || options.state == 0
+            || options.key == 0
+            || options.memory == 0
+            || options.chunk == 0
+        {
+            return Err("epochs, latent, state, key, memory, and chunk must be positive".into());
+        }
+        if !(1..=32).contains(&options.depth) {
+            return Err("--depth must be between 1 and 32".into());
+        }
+        if !options.lr.is_finite() || options.lr <= 0.0 {
+            return Err("learning rate must be finite and positive".into());
+        }
+        if options.max_tokens == Some(0) {
+            return Err("max_tokens must be positive when supplied".into());
+        }
+
+        let (mut trainer, tokenizer) = match options.resume.as_deref() {
+            Some(path) => {
+                let loaded = checkpoint::load_checkpoint(path)
+                    .map_err(|e| format!("cannot resume from '{path}': {e}"))?;
+                let model = loaded.model;
+                let tokenizer = match &model.tokenizer_json {
+                    Some(json) => Tokenizer::from_serialized(json)?,
+                    None => Tokenizer::from_vocabulary(&model.vocabulary)?,
+                };
+                if tokenizer.vocab_size != model.cfg.d_vocab
+                    || tokenizer.ordered_vocabulary()? != model.vocabulary
+                {
+                    return Err("resume checkpoint tokenizer/vocabulary mismatch".into());
+                }
+                let config = Self::interdiffusion_config(options);
+                let trainer = crate::interdiffusion::InterdiffusionTrainer::from_checkpoint_model(
+                    &model,
+                    options.seed,
+                    config,
+                )?;
+                (trainer, tokenizer)
+            }
+            None => {
+                let tokenizer = match options.tokenizer {
+                    TokenizerKind::Word => Tokenizer::from_corpus(raw, true)?,
+                    TokenizerKind::Bpe => Tokenizer::from_corpus_bpe(raw, options.vocab_size)?,
+                };
+                let cfg = PSSAConfigV2 {
+                    d_vocab: tokenizer.vocab_size,
+                    d_latent: options.latent,
+                    depth: options.depth,
+                    d_state: options.state,
+                    d_mem_key: options.key,
+                    mem_capacity: options.memory,
+                    chunk_len: options.chunk,
+                    lr: options.lr,
+                    ..Default::default()
+                };
+                checkpoint::validate_model_config(&cfg)?;
+                let trainer = crate::interdiffusion::InterdiffusionTrainer::new(
+                    cfg,
+                    options.seed,
+                    Self::interdiffusion_config(options),
+                )?;
+                (trainer, tokenizer)
+            }
+        };
+        trainer.set_tokenizer_metadata(
+            tokenizer.ordered_vocabulary()?,
+            tokenizer.serialized_metadata(),
+        );
+        trainer.set_checkpoint_learning_rate(options.lr);
+        trainer.set_memory_value_cap(options.memory_value_cap);
+
+        let docs = Self::documents_with_cache(
+            raw,
+            &tokenizer,
+            options.max_tokens,
+            options.skip_tokens,
+            options.token_cache.as_deref().map(Path::new),
+            options.token_cache_source.as_deref().map(Path::new),
+        )?;
+        let chunk_len = trainer.forward_config().chunk_len;
+        let plan = crate::training::chunk_plan(&docs, chunk_len);
+        let (stored_horizon, stored_warmup) = trainer.schedule_metadata();
+        let schedule = crate::training::Schedule::new_with_warmup(
+            plan.len(),
+            trainer.step_counter(),
+            stored_horizon,
+            stored_warmup,
+            options,
+        )?;
+        let update_count = schedule.updates;
+        println!(
+            "optimizer=interdiffusion backend=cpu parameters={} vocab={} depth={} updates={} lr_first={:.8} lr_last={:.8}",
+            trainer.parameter_count(),
+            tokenizer.vocab_size,
+            options.depth,
+            update_count,
+            schedule.lr(1)?,
+            schedule.lr(update_count)?,
+        );
+        let started = Instant::now();
+        let mut update = 0;
+        let mut seen = 0usize;
+        for epoch in 0..options.epochs {
+            let mut epoch_loss = 0.0;
+            let mut epoch_tokens = 0usize;
+            for &(doc, start, len) in &plan {
+                let lr = schedule.lr(update + 1)?;
+                trainer.set_learning_rates(lr, lr)?;
+                let report = trainer.train_step(
+                    &docs[doc][start..start + len],
+                    &docs[doc][start + 1..start + 1 + len],
+                    start == 0,
+                    true,
+                )?;
+                if !report.loss.is_finite() {
+                    return Err(format!(
+                        "non-finite Interdiffusion loss at update {}",
+                        update + 1
+                    ));
+                }
+                update += 1;
+                seen += len;
+                epoch_tokens += len;
+                epoch_loss += report.loss * len as f64;
+            }
+            println!(
+                "epoch {}/{} loss={:.6} tokens={} updates={}",
+                epoch + 1,
+                options.epochs,
+                epoch_loss / epoch_tokens.max(1) as f64,
+                epoch_tokens,
+                update,
+            );
+        }
+        let mut model = trainer.into_model()?;
+        model.lr_schedule_total_updates = schedule.fixed_horizon;
+        model.lr_schedule_warmup_steps = schedule.fixed_horizon.map(|_| schedule.warmup);
+        println!(
+            "training_seconds={:.3} optimizer_updates={} tokens={} tokens_per_second={:.0}",
+            started.elapsed().as_secs_f64(),
+            update,
+            seen,
+            seen as f64 / started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE),
+        );
+        Ok((model, tokenizer))
+    }
+
+    fn interdiffusion_config(
+        options: &TrainingOptions,
+    ) -> crate::interdiffusion::InterdiffusionConfig {
+        crate::interdiffusion::InterdiffusionConfig {
+            head_learning_rate: options.lr,
+            body_learning_rate: options.lr,
+            max_gradient_norm: options.grad_clip.unwrap_or(1.0),
+            ..Default::default()
+        }
+    }
+
     pub fn run_training(data: &str, options: &TrainingOptions, out: &str) -> Result<(), String> {
         let _plain_output = ui::plain_output(options.no_tui);
         let raw = if let Some(dataset) = options.hf_dataset.as_deref() {
@@ -1900,6 +2108,11 @@ impl CLIHandler {
         println!("    {bin} train [source] [-d|--data source] [-o|--out path]");
         println!(
             "    {:<48}{}",
+            "  --optimizer adamw|interdiffusion",
+            ui::dim("default adamw; Interdiffusion is CPU-only and currently serial"),
+        );
+        println!(
+            "    {:<48}{}",
             "  --tokenizer bpe|word",
             ui::dim("default bpe")
         );
@@ -2111,6 +2324,9 @@ impl CLIHandler {
                 );
                 println!();
                 println!("Options:");
+                println!(
+                    "      --optimizer <NAME>        adamw (default) or interdiffusion (CPU, serial)"
+                );
                 println!(
                     "  -d, --data <SOURCE>           dataset source (also accepted as SOURCE)"
                 );
@@ -2455,6 +2671,7 @@ impl CLIHandler {
                     "--loss-csv",
                     "--loss-every",
                     "--tokens-seen",
+                    "--optimizer",
                     "--no-tui",
                     "--threads",
                     "--ram-mib",
@@ -2491,6 +2708,9 @@ impl CLIHandler {
                 ])?;
                 if baseline && p.string("--hf-dataset", "").is_some() {
                     return Err("--hf-dataset is supported by train, not train-transformer".into());
+                }
+                if baseline && p.string("--optimizer", "").is_some() {
+                    return Err("--optimizer is supported by train, not train-transformer".into());
                 }
                 for (names, label) in [
                     (&["--data", "-d"][..], "--data"),

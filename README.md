@@ -22,6 +22,10 @@ quality or general-purpose acceleration. The current research areas are:
 
 - certified sparse memory and vocabulary inference;
 - Interdiffusion, an opt-in CPU training experiment;
+- Interdiffusion can be selected for ordinary MSSA training with
+  `--optimizer interdiffusion`; AdamW remains the explicit baseline;
+- context-conditioned curved token geometry, currently an isolated negative
+  result on a frozen-backbone study;
 - WebGPU and CUDA execution paths inherited from upstream;
 - bounded episodic memory, plastic adapters, and dream replay.
 
@@ -74,6 +78,8 @@ are in [`docs/MEASURED_RESULTS.md`](docs/MEASURED_RESULTS.md),
 [`docs/COMPARISON.md`](docs/COMPARISON.md).
 The current four-study research run is documented in
 [`docs/RESEARCH_STUDIES.md`](docs/RESEARCH_STUDIES.md).
+The opt-in curved token-head study is documented in
+[`docs/CURVED_TOKEN_GEOMETRY.md`](docs/CURVED_TOKEN_GEOMETRY.md).
 
 ## Architecture
 

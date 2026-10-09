@@ -12,6 +12,7 @@ data/downloaded.txt
 
 for.txt/.cargo/
 /.cargo/
+__pycache__/
 __agent__/
 
 # Agent working notes and internal handoffs
@@ -26,6 +27,7 @@ docs/PROJECT-HANDOFF-*
 
 # Local manuscript retained until publication
 /paper.pdf
+/hypernetwork_paper.pdf
 
 # agent scratch notes, keep out of the repo
 *_FINDINGS.md

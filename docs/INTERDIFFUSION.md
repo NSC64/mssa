@@ -42,6 +42,38 @@ The final development loss selects the learning rate separately for each
 method/task/seed. Test results never select a trial. All candidate runs remain
 in the record, including candidates that perform poorly.
 
+## Use it for ordinary MSSA training
+
+The normal training command accepts an explicit optimizer choice:
+
+```bash
+mssa train data/train.txt \
+  --optimizer interdiffusion \
+  --tokenizer bpe \
+  --batch-size 1 --accumulate 1 \
+  --out data/interdiffusion.pssa
+```
+
+This checkpoint-capable path is CPU-only and serial. It writes a regular `.pssa`
+checkpoint, so inference and scoring use the normal MSSA commands. Resume it
+with the same optimizer flag:
+
+```bash
+mssa train data/train.txt \
+  --optimizer interdiffusion \
+  --batch-size 1 --accumulate 1 \
+  --resume data/interdiffusion.pssa \
+  --out data/interdiffusion-02.pssa
+```
+
+Readout Adam moments are restored from the checkpoint. Eligibility/probe scratch
+and body optimizer state are rebuilt on resume; an uninterrupted run is not
+bit-equivalent to a resumed run. Packed batches, gradient accumulation other
+than `--accumulate 1`, dream replay, loss CSV logging, and repeated Ouro loops
+currently reject explicitly rather than silently using different semantics.
+AdamW remains available with
+`--optimizer adamw`.
+
 ## Lightweight runtime and library API
 
 `ForwardModel` initializes exactly the same weights, timescales and adapters as

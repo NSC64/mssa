@@ -402,6 +402,92 @@ pub struct InterdiffusionTrainer {
 }
 
 impl InterdiffusionTrainer {
+    /// Build a streaming Interdiffusion runtime from a regular MSSA checkpoint.
+    /// Head moments resume exactly; bounded eligibility/probe state is rebuilt.
+    pub fn from_checkpoint_model(
+        model: &PSSALayerV2,
+        seed: u64,
+        config: InterdiffusionConfig,
+    ) -> Result<Self, String> {
+        if model.loops() != 1 {
+            return Err(
+                "Interdiffusion currently supports one temporal loop; resume with --loops 1".into(),
+            );
+        }
+        let mut trainer = Self::new(model.cfg.clone(), seed, config)?;
+        super::copy_model_state(&mut trainer.forward.model, model)?;
+        if trainer.head_m.len() != model.unembed_w.m.len()
+            || trainer.head_v.len() != model.unembed_w.v.len()
+        {
+            return Err("Interdiffusion checkpoint readout optimizer shape mismatch".into());
+        }
+        trainer.head_m.copy_from_slice(&model.unembed_w.m);
+        trainer.head_v.copy_from_slice(&model.unembed_w.v);
+        trainer.rng.state = model.rng.state;
+        Ok(trainer)
+    }
+
+    /// Copy tokenizer/checkpoint metadata into the forward-only runtime.
+    pub fn set_tokenizer_metadata(
+        &mut self,
+        vocabulary: Vec<String>,
+        tokenizer_json: Option<String>,
+    ) {
+        self.forward.set_metadata(vocabulary, tokenizer_json);
+    }
+
+    /// Apply a runtime-only memory value cap to every Interdiffusion bank.
+    pub fn set_memory_value_cap(&mut self, value_cap: Option<f32>) {
+        for block in std::iter::once(&mut self.forward.model.block)
+            .chain(&mut self.forward.model.extra_blocks)
+        {
+            block
+                .memory
+                .set_value_cap_with_device(value_cap, &crate::backend::Device::Cpu);
+        }
+    }
+
+    pub fn step_counter(&self) -> usize {
+        self.forward.model.step_counter
+    }
+
+    pub fn parameter_count(&self) -> usize {
+        self.forward.model.parameter_count()
+    }
+
+    pub fn forward_config(&self) -> &PSSAConfigV2 {
+        self.forward.config()
+    }
+
+    pub fn schedule_metadata(&self) -> (Option<usize>, Option<usize>) {
+        (
+            self.forward.model.lr_schedule_total_updates,
+            self.forward.model.lr_schedule_warmup_steps,
+        )
+    }
+
+    pub fn set_checkpoint_learning_rate(&mut self, lr: f32) {
+        self.forward.model.cfg.lr = lr;
+    }
+
+    /// Materialize a normal checkpoint-capable MSSA model after streaming
+    /// training. Body eligibility state is intentionally rebuilt on resume;
+    /// readout Adam moments are preserved in the ordinary checkpoint fields.
+    pub fn into_model(self) -> Result<PSSALayerV2, String> {
+        let source = &self.forward.model;
+        let mut model = PSSALayerV2::new(source.cfg.clone(), source.rng.state);
+        super::copy_model_state(&mut model, source)?;
+        if model.unembed_w.m.len() != self.head_m.len()
+            || model.unembed_w.v.len() != self.head_v.len()
+        {
+            return Err("Interdiffusion output readout optimizer shape mismatch".into());
+        }
+        model.unembed_w.m.copy_from_slice(&self.head_m);
+        model.unembed_w.v.copy_from_slice(&self.head_v);
+        model.rng.state = self.rng.state;
+        Ok(model)
+    }
+
     /// Change rates for a caller-owned schedule without resetting optimizer state.
     pub fn set_learning_rates(&mut self, head: f32, body: f32) -> Result<(), String> {
         let mut options = self.config;
@@ -667,9 +753,10 @@ impl InterdiffusionTrainer {
         let mut loss = 0.0;
         self.head_grad.fill(0.0);
         self.head_curvature.fill(0.0);
+        // The base pass does not commit memory, so this route is invariant for
+        // the whole chunk. Keep the eligibility decision out of the token loop.
+        let use_eligibility = self.eligibility.is_some() && self.forward.model.memory.count == 0;
         for (&input, &target) in inputs.iter().zip(targets) {
-            let use_eligibility =
-                self.eligibility.is_some() && self.forward.model.memory.count == 0;
             if use_eligibility {
                 let eligibility = self.eligibility.as_mut().unwrap();
                 eligibility.before_token(&self.forward.model.block);

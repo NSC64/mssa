@@ -235,6 +235,15 @@ production accumulation order; exact vocabulary rows use the same SIMD dot
 kernel as dense inference, with conservative numerical bound guards. Routing,
 sorting and fallback still incur costs, all present in the measured batches.
 
+The retained CVP implementation also has a bounded dense backoff: after three
+consecutive full scans it bypasses routing for the next 31 queries, then retries
+the certificate. The backoff is exact and telemetry is reported separately from
+CVP full-scan counts. In the release rerun, diffuse fixtures used a mean 232
+backoff reads per 256-token batch, while trained and held-out banks used zero;
+all CVP IDs still agreed with exhaustive greedy selection. This is a routing
+cost safeguard, not evidence of a universal CVP speedup; diffuse CVP measured
+`0.987x` dense in that run.
+
 Certificate sparsity reduces **read/aggregation work**, not allocated trained
 parameter memory. It adds index storage. Interdiffusion's training-memory saving
 is independently measured and does not depend on certificate termination.

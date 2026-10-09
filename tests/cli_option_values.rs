@@ -175,3 +175,64 @@ fn negative_numeric_option_value_reaches_domain_validation() {
 
     assert_eq!(error, "--temp must be >= 0");
 }
+
+#[test]
+fn interdiffusion_optimizer_writes_and_resumes_a_normal_checkpoint() {
+    use std::{fs, process::Command};
+
+    let root = std::env::temp_dir().join(format!("pssa-interdiffusion-cli-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let corpus = root.join("corpus.txt");
+    let first = root.join("first.pssa");
+    let second = root.join("second.pssa");
+    fs::write(
+        &corpus,
+        "alpha beta gamma delta epsilon zeta eta theta\n".repeat(8),
+    )
+    .unwrap();
+    let run = |output: &std::path::Path, extra: &[&str]| {
+        let mut args = vec![
+            "train",
+            corpus.to_str().unwrap(),
+            "--optimizer",
+            "interdiffusion",
+            "--tokenizer",
+            "word",
+            "--epochs",
+            "1",
+            "--latent",
+            "8",
+            "--state",
+            "2",
+            "--key",
+            "2",
+            "--memory",
+            "4",
+            "--chunk",
+            "4",
+            "--batch-size",
+            "1",
+            "--accumulate",
+            "1",
+            "--no-tui",
+            "--out",
+            output.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let result = Command::new(env!("CARGO_BIN_EXE_pssa"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    run(&first, &[]);
+    run(&second, &["--resume", first.to_str().unwrap()]);
+    assert!(fs::metadata(&first).unwrap().len() > 22);
+    assert!(fs::metadata(&second).unwrap().len() > 22);
+    fs::remove_dir_all(root).unwrap();
+}
